@@ -4,21 +4,21 @@ module Web.Authenticate.SQRL.SecureStorage where
 import Web.Authenticate.SQRL
 import Web.Authenticate.SQRL.Client
 
-data SecureStorageBlock00001
-  = SecureStorageBlock00001
-    { ss00001CryptoIV     :: ByteString
-    , ss00001ScryptSalt   :: ByteString
-    , ss00001ScryptLogN   :: Word8
-    , ss00001ScryptIter   :: Word32
-    , ss00001Flags        :: ClientFlags
-    , ss00001HintLen      :: Word8
-    , ss00001HintIdle     :: Word16
-    , ss00001PlainExtra   :: ByteString
-    , ss00001MasterKey    :: MasterKey
-    , ss00001LockKey      :: PrivateKey
-    , ss00001UnlockKey    :: UnlockKey
-    , ss00001EncryptExtra :: ByteString
-    , ss00001VerifyTag    :: ByteString
+data SecureStorageBlock1
+  = SecureStorageBlock1
+    { ss1CryptoIV     :: ByteString
+    , ss1ScryptSalt   :: ByteString
+    , ss1ScryptLogN   :: Word8
+    , ss1ScryptIter   :: Word32
+    , ss1Flags        :: ClientFlags
+    , ss1HintLen      :: Word8
+    , ss1HintIdle     :: Word16
+    , ss1PlainExtra   :: ByteString
+    , ss1MasterKey    :: MasterKey
+    , ss1LockKey      :: PrivateKey
+    , ss1UnlockKey    :: UnlockKey
+    , ss1EncryptExtra :: ByteString
+    , ss1VerifyTag    :: ByteString
     }
 
 type ClientFlags = Word16
@@ -55,7 +55,7 @@ clientFlagDiscardOnUserSwitch = 0x0040
 
 -- | When set, this bit instructs the SQRL client to wash any existing local password and hint data from RAM when the system has been user-idle (no mouse or keyboard activity) for the number of minutes specified by the two-byte idle timeout.
 --
--- Notice: The idle time in 'SecureStorageBlock00001' is in minutes, when time=0 then no hint is allowed. It is quite clear that this is idle system-wide and not only in usage of SQRL. But since the idle time is allowed to be more than a month; a developer could see this as clearing the hint after being idle in the sense of no SQRL authentications for the specified amounts of minutes.
+-- Notice: The idle time in 'SecureStorageBlock1' is in minutes, when time=0 then no hint is allowed. It is quite clear that this is idle system-wide and not only in usage of SQRL. But since the idle time is allowed to be more than a month; a developer could see this as clearing the hint after being idle in the sense of no SQRL authentications for the specified amounts of minutes.
 clientFlagDiscardOnIdle :: ClientFlags
 clientFlagDiscardOnIdle = 0x0080
 
@@ -67,7 +67,7 @@ clientFlagsDefault = 0x00F1
 
 
 
-instance Binary SecureStorageBlock00001 where
+instance Binary SecureStorageBlock1 where
   get = do blocklen <- getWord16
            if blocklen < 157 then fail "Block too small"
              else do blockt <- getWord16
@@ -75,26 +75,26 @@ instance Binary SecureStorageBlock00001 where
                        else do ptlen <- getWord16
                                if ptlen < 45 then fail "Inner block to small"
                                  else if ptlen + 112 > blocklen then fail "Inner block to large to fit outer block"
-                                      else SecureStorageBlock00001
+                                      else SecureStorageBlock1
                                            <$> getByteString 12 <*> getByteString 16 <*> getWord8 <*> getWord32       -- IV and scrypt params
                                            <*> getWord16 <*> getWord8 <*> getWord16 <*> getByteString (ptlen - 45)    -- additional plain text
                                            <*> getByteString 32 <*> getByteString 32 <*> getByteString 32             -- encrypted keys
                                            <*> getByteString (blocklen - ptlen - 112)                                 -- additional encrypted data
                                            <*> getByteString 16                                                       -- auth tag
-  put b =  putWord16 (157 + BS.length (ss00001PlainExtra b) + BS.length (ss00001EncryptExtra b)) <*> putWord16 1 
-       <*> putWord16 (45 + BS.length (ss00001PlainExtra b))
-       <*> putByteString (ss00001CryptoIV b) <*> putByteString (ss00001ScryptSalt b)
-       <*> putWord8 (ss00001ScryptLogN b) <*> putWord32 (ss00001ScryptIter b)
-       <*> putWord16 (ss00001Flags b) <*> putWord8 (ss00001HintLen b) <*> putWord16 (ss00001HintIdle b)
-       <*> putByteString (ss00001PlainExtra b)
-       <*> putByteString (ss00001MasterKey b) <*> putByteString (ss00001LockKey b)
-       <*> putByteString (ss00001UnlockKey b) <*> putByteString (ss00001EncryptExtra b)
-       <*> putByteString (ss00001VerifyTag b)
+  put b =  putWord16 (157 + BS.length (ss1PlainExtra b) + BS.length (ss1EncryptExtra b)) <*> putWord16 1 
+       <*> putWord16 (45 + BS.length (ss1PlainExtra b))
+       <*> putByteString (ss1CryptoIV b) <*> putByteString (ss1ScryptSalt b)
+       <*> putWord8 (ss1ScryptLogN b) <*> putWord32 (ss1ScryptIter b)
+       <*> putWord16 (ss1Flags b) <*> putWord8 (ss1HintLen b) <*> putWord16 (ss1HintIdle b)
+       <*> putByteString (ss1PlainExtra b)
+       <*> putByteString (ss1MasterKey b) <*> putByteString (ss1LockKey b)
+       <*> putByteString (ss1UnlockKey b) <*> putByteString (ss1EncryptExtra b)
+       <*> putByteString (ss1VerifyTag b)
 
 
 -- | A collection of related data connected to a specific SQRL profile.
 data SecureStorageBlock =
-  Block00001 SecureStorageBlock00001 -- ^ The most basic of storage blocks. Contains information about master key and encryption settings.
+  Block00001 SecureStorageBlock1 -- ^ The most basic of storage blocks. Contains information about master key and encryption settings.
   BlockOther Int LBS.ByteString      -- ^ Any other block not supported by the specification at the time of writing, or chosen not to implement. Pull requests are welcome.
 
 -- | A secure storage for a SQRL profile. Contains encrypted keys and SQRL settings.
@@ -106,7 +106,7 @@ secureStorageData (Block00001 b) = encode b
 secureStorageData (BlockOther _ bs) = bs
 
 -- | Get a structured version of the data contained by the block of type 1.
-secureStorageData1 :: SecureStorage -> Maybe SecureStorageBlock00001
+secureStorageData1 :: SecureStorage -> Maybe SecureStorageBlock1
 secureStorageData1 (SecureStorage _ ss) = case find ((==) 1 . secureStorageType) ss of
   Just (Block00001 b) -> Just b
   _ -> Nothing
