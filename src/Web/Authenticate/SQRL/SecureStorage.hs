@@ -4,6 +4,46 @@ module Web.Authenticate.SQRL.SecureStorage where
 import Web.Authenticate.SQRL
 import Web.Authenticate.SQRL.Client
 
+
+-- | A general interface to all blocks containing encrypted data. This allows for the use of 'ssDecrypt' to be applied to all blocks, with the exception of 'BlockOther'.
+-- |
+-- | Note: If all but 'ssDecrypt' are bound and the decrypted type @r@ is an instance of 'Binary' the default 'ssDecrypt' will do the job.
+class SecureStorageEncrypted block r where
+  -- | Any IV used for encryption and verification.
+  ssIV      :: block -> ByteString
+  -- | Initial salt for the generation of the 'ProfilePasskey'.
+  ssSalt    :: block -> ByteString
+  -- | Complexity of each iteration of Scrypt.
+  ssLogN    :: block -> Word8
+  -- | Iteration count for Scrypt.
+  ssIter    :: block -> Word32
+  -- | Any not encrypted values which sould also be verified.
+  ssAAD     :: block -> ByteString
+  -- | The encrypted content to decrypt.
+  ssEncData :: block -> ByteString
+  -- | The tag to verify encrypted content to.
+  ssVerTag  :: block -> ByteString
+  -- | Decrypt this block type and return decrypted data.
+  ssDecrypt :: Text -> block -> Maybe r
+  default ssDecrypt :: Binary r => Text -> block -> Maybe r
+  ssDecrypt pass b = let pass' = Scrypt.Pass (BS.snoc (TE.encodeUtf8 pass) 0)
+                         pssky = thePassKey $ iterscrypt (ssIter b) (Scrypt.scryptParamsLen (toIntegral $ ssLogN b) 256 1 32) (ssSalt b) pass'
+                         (r, tag) = decryptGCM (initAES pssky) (ssIV b) (ssAAD b) (ssEncData b)
+                     in if toBytes tag /= ssVerTag b then Nothing
+                        else case decodeOrFail $ LBS.fromStrict r of
+                              Left _ -> error "ssDecrypt: tag matched but encrypted data is somehow corrupt."
+                              Right (_, _, r') -> Just r
+
+-- | A type representing an master pass key. Destroy as soon as possible.
+newtype ProfilePasskey = PassKey { thePassKey :: ByteString }
+
+-- | Iterate the Scrypt function to get a 'ProfilePasskey'.
+iterscrypt :: Word32 -> Scrypt.ScryptParams -> ByteString -> Scrypt.Pass -> ProfilePasskey
+iterscrypt 0 _ x _ = PassKey x
+iterscrypt i p x y = let r = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt x) y in PassKey $ iterscrypt' (i-1) r
+  where iterscrypt' 0 a = a
+        iterscrypt' n r = let r' = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt r) y in iterscrypt' (n-1) $ BS.pack $ BS.zipWith xor r r'
+
 -- | Type 1 - User access password authenticated & encrypted data
 --
 -- The type 1 'SecureStorage' block supplies the EnScrypt parameters to convert a user-supplied “local access passcode” into a 256-bit symmetric key,
@@ -19,12 +59,29 @@ data SecureStorageBlock1
     , ss1PwVerifySec  :: PWHashingTime -- ^ seconds to run PW EnScrypt
     , ss1HintIdle     :: Word16        -- ^ idle minutes before wiping PW
     , ss1PlainExtra   :: ByteString    -- ^ extended binary data not in spec as of yet
-    , ss1MasterKey    :: MasterKey     -- ^ encrypted identity master key
-    , ss1LockKey      :: PrivateKey    -- ^ encrypted identity lock key
-    , ss1UnlockKey    :: UnlockKey     -- ^ optional identity unlock key for previous identity (compare to 'emptyUnlockKey')
-    , ss1EncryptExtra :: ByteString    -- ^ extended encrypted data not in spec as of yet
+    , ss1Encrypted    :: ByteString    -- ^ encrypted master key, lock key, unlock key etc (see 'SecureStorageBlock1Decrypted')
     , ss1VerifyTag    :: ByteString    -- ^ signature to validate no external changes has been made
     }
+
+-- | This is the decrypted data of 'SecureStorageBlock1' and contains decrypted keys and aditional decrypted data.
+data SecureStorageBlock1Decrypted
+  = SecureStorageBlock1Decrypted
+    { identityMasterKey :: MasterKey   -- ^ decrypted identity master key
+    , identityLockKey   :: PrivateKey  -- ^ decrypted identity lock key
+    , identityUnlockKey :: UnlockKey   -- ^ optional identity unlock key for previous identity (compare to 'emptyUnlockKey')
+    , ss1DecryptedExtra :: ByteString  -- ^ extended encrypted data not in spec as of yet
+    }
+
+-- | 'ssDecrypt' should be used to decrypt a 'SecureStorageBlock1' from a passphrase.
+instance SecureStorageEncrypted SecureStorageBlock1 SecureStorageBlock1Decrypted where
+  ssIV = ss1CryptoIV
+  ssSalt = ss1ScryptSalt
+  ssLogN = ss1ScryptLogN
+  ssIter = ss1ScryptIter
+  ssAAD x = runGet (lookAhead (skip 32 *> getWord16) >>= getByteString . fromIntegral) (encode x)
+  ssEncData = ss1Encrypted
+  ssVerTag = ss1VerifyTag
+
 
 -- | Type 2 - Rescue code encrypted data
 --
@@ -35,10 +92,27 @@ data SecureStorageBlock2
     { ss2ScryptSalt   :: ByteString      -- ^ update for password change
     , ss2ScryptLogN   :: Word8           -- ^ memory consumption factor
     , ss2ScryptIter   :: Word32          -- ^ time consumption factor
-    , ss2UnlockKey    :: IdentityUnlock  -- ^ emergency rescue code
-    , ss1EncryptExtra :: ByteString      -- ^ extended encrypted data not in spec as of yet
+    , ss2Encrypted    :: ByteString      -- ^ encrypted emergency rescue code and any extended encrypted data not in spec as of yet (see 'SecreStorageBLock2Decrypted')
     , ss2VerifyTag    :: ByteString      -- ^ signature to validate no external changes has been made
     }
+
+-- | This is the decrypted data of 'SecureStorageBlock2' and contains an emergency rescue code to transfer an identity.
+data SecreStorageBlock2Decrypted
+  = SecureStorageBlock2Decrypted
+    { emergencyRescueCode :: ByteString    -- ^ decrypted emergency rescue code
+    , ss2DecryptedExtra   :: ByteString    -- ^ extended decrypted data not in spec as of yet
+    }
+
+
+-- | 'ssDecrypt' should be used to decrypt a 'SecureStorageBlock2' from a passphrase.
+instance SecureStorageEncrypted SecureStorageBlock2 SecureStorageBlock2Decrypted where
+  ssIV _ = BS.replicate 12 0
+  ssSalt = ss2ScryptSalt
+  ssLogN = ss2ScryptLogN
+  ssIter = ss2ScryptIter
+  ssAAD _ = BS.empty
+  ssEncData = ss2Encrypted
+  ssVerTag = ss2VerifyTag
 
 -- | This two-byte value contains a set of individual single-bit flags corresponding to options offered by SQRL's user-interface.
 type ClientFlags = Word16
@@ -118,16 +192,15 @@ instance Binary SecureStorageBlock1 where
                                            <$> getByteString 12 <*> getByteString 16 <*> getWord8 <*> getWord32       -- IV and scrypt params
                                            <*> getWord16 <*> getWord8 <*> getWord16 <*> getByteString (ptlen - 45)    -- additional plain text
                                            <*> getByteString 32 <*> getByteString 32 <*> getByteString 32             -- encrypted keys
-                                           <*> getByteString (blocklen - ptlen - 112)                                 -- additional encrypted data
+                                           <*> getByteString (blocklen - ptlen - 16)                                  -- all encrypted data
                                            <*> getByteString 16                                                       -- auth tag
-  put b =  putWord16 (157 + BS.length (ss1PlainExtra b) + BS.length (ss1EncryptExtra b)) <*> putWord16 1 
+  put b =  putWord16 (61 + BS.length (ss1PlainExtra b) + BS.length (ss1Encrypted b)) <*> putWord16 1 
        <*> putWord16 (45 + BS.length (ss1PlainExtra b))
        <*> putByteString (ss1CryptoIV b) <*> putByteString (ss1ScryptSalt b)
        <*> putWord8 (ss1ScryptLogN b) <*> putWord32 (ss1ScryptIter b)
        <*> putWord16 (ss1Flags b) <*> putWord8 (ss1HintLen b) <*> putWord16 (ss1HintIdle b)
        <*> putByteString (ss1PlainExtra b)
-       <*> putByteString (ss1MasterKey b) <*> putByteString (ss1LockKey b)
-       <*> putByteString (ss1UnlockKey b) <*> putByteString (ss1EncryptExtra b)
+       <*> putByteString (ss1Encrypted b)
        <*> putByteString (ss1VerifyTag b)
 
 
@@ -138,18 +211,13 @@ instance Binary SecureStorageBlock2 where
                      if blockt /= 2 then fail $ "Block type mismatch expected 2 got " ++ show blockt
                        else SecureStorageBlock2
                             <$> getByteString 16 <*> getWord8 <*> getWord32       -- scrypt params
-                            <*> getByteString 32                                  -- encrypted keys
-                            <*> getByteString (blocklen - 73)                     -- additional encrypted data
+                            <*> getByteString (blocklen - 41)                     -- encrypted key and any additional encrypted data
                             <*> getByteString 16                                  -- auth tag
-  put b =  putWord16 (157 + BS.length (ss1PlainExtra b) + BS.length (ss1EncryptExtra b)) <*> putWord16 1 
-       <*> putWord16 (45 + BS.length (ss1PlainExtra b))
-       <*> putByteString (ss1CryptoIV b) <*> putByteString (ss1ScryptSalt b)
-       <*> putWord8 (ss1ScryptLogN b) <*> putWord32 (ss1ScryptIter b)
-       <*> putWord16 (ss1Flags b) <*> putWord8 (ss1HintLen b) <*> putWord16 (ss1HintIdle b)
-       <*> putByteString (ss1PlainExtra b)
-       <*> putByteString (ss1MasterKey b) <*> putByteString (ss1LockKey b)
-       <*> putByteString (ss1UnlockKey b) <*> putByteString (ss1EncryptExtra b)
-       <*> putByteString (ss1VerifyTag b)
+  put b =  putWord16 (41 + BS.length (ss2Encrypted b)) <*> putWord16 2
+       <*> putByteString (ss2ScryptSalt b)
+       <*> putWord8 (ss2ScryptLogN b) <*> putWord32 (ss2ScryptIter b)
+       <*> putByteString (ss2Encrypted b)
+       <*> putByteString (ss2VerifyTag b)
 
 
 -- | A collection of related data connected to a specific SQRL profile.
@@ -165,7 +233,7 @@ data SecureStorage = SecureStorage Bool String [SecureStorageBlock]
 secureStorageData :: SecureStorageBlock -> LBS.ByteString
 secureStorageData (Block00001 b) = encode b
 secureStorageData (Block00002 b) = encode b
-secureStorageData (BlockOther _ bs) = bs
+secureStorageData (BlockOther n bs) = LBS.append (runPut (putWord16 (4 + LBS.length bs) *> putWord16 n)) bs
 
 -- | Get a structured version of the data contained by the block of type 1.
 secureStorageData1 :: SecureStorage -> Maybe SecureStorageBlock1
@@ -225,5 +293,9 @@ saveSecureStorage _ = return ()
 -- > openSecureStorage "original.ssss" >>= saveSecureStorage . copySecureStorage "copy.ssss" . either (\err -> error err) id
 copySecureStorage :: FilePath -> SecureStorage -> SecureStorage
 copySecureStorage fp (SecureStorage _ _ ss) = SecureStorage False fp ss
+
+
+
+
 
 
