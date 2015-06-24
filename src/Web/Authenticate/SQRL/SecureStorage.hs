@@ -99,10 +99,14 @@ data SecureStorageBlock2
 -- | This is the decrypted data of 'SecureStorageBlock2' and contains an emergency rescue code to transfer an identity.
 data SecreStorageBlock2Decrypted
   = SecureStorageBlock2Decrypted
-    { emergencyRescueCode :: ByteString    -- ^ decrypted emergency rescue code
+    { emergencyRescueCode :: RescueCode    -- ^ decrypted emergency rescue code
     , ss2DecryptedExtra   :: ByteString    -- ^ extended decrypted data not in spec as of yet
     }
 
+
+instance Binary SecureStorageBlock2Decrypted where
+  put b = let (RescueCode erc) = emergencyRescueCode b in putByteString erc *> putByteString (ss2DecryptedExtra b)
+  get = SecureStorageBlock2Decrypted <$> getByteString 32 <*> (LBS.toStrict <$> getRemainingLazyByteString)
 
 -- | 'ssDecrypt' should be used to decrypt a 'SecureStorageBlock2' from a passphrase.
 instance SecureStorageEncrypted SecureStorageBlock2 SecureStorageBlock2Decrypted where
@@ -295,7 +299,53 @@ copySecureStorage :: FilePath -> SecureStorage -> SecureStorage
 copySecureStorage fp (SecureStorage _ _ ss) = SecureStorage False fp ss
 
 
+data SQRLProfile
+  = SQRLProfile
+    { profileName          :: Text
+    , profileUsed          :: UTCTime
+    , profileSecureStorage :: IO (Either String SecureStorage)
+    }
 
+dirSep :: String
+dirSep = "/"
 
+listProfilesInDir :: FilePath -> IO [SQRLProfile]
+listProfilesInDir dir = do
+  dd <- map (init . dropWhileEnd ('.'/=))  <$> filter (isSuffixOf ".ssss") <$> getDirectoryContents dir
+  catMaybes <$> mapM openProfile dd
+  where openProfile d' = case (if all (\x -> x > ' ' && x < 'z') d' then B64U.decode (BS.pack $ map (fromIntegral . fromEnum) d') else Left undefined) of
+          Left _ -> return Nothing
+          Right bs -> let f = dir ++ "/" ++ d' ++ ".time" in do
+            t <- catch (getModificationTime f) (const (return 0) :: IOError -> IO UTCTime)
+            return $ Just $ SQRLProfile (TE.decodeUtf8 bs) t $ openSecureStorage f
 
+listProfiles :: IO [SQRLProfile]
+listProfiles = profilesDirectory >>= listProfilesInDirs
 
+profilesDirectory :: IO FilePath
+profilesDirectory = getAppUserDataDirectory $ "sqrl" ++ dirSep ++ "profiles"
+
+createProfileInDir :: Text -> Text -> FilePath -> IO (Either String (SQRLProfile, RescueCode))
+createProfileInDir name pass dir =
+  let f = dir ++ dirSep ++ map (toEnum . fromIntegral) $ BS.unpack $ B64U.encode $ TE.encodeUtf8 name
+  in do g <- newGenIO
+        epair <- ED25519.generateKeyPair g
+        case epair of
+         Left err -> return $ Left $ show err
+         Right (PublicKey lockkey, SecretKey unlockkey, g') -> do
+           ercode <- genRcode g'
+           case ercode of
+            Left err -> return $ Left $ show err
+            Right (rcode, _) -> undefined -- XXX: encrypt stuff and create files
+            
+  where genRcode g = genBytes 10 g >>= \x -> case x of
+          Left err -> return $ Left err
+          Right (bsrcode, g') ->
+            let rcode :: Integral
+                rcode = runGet ((\(x, y) -> (fromIntegral x `shiftL` 8) .|. fromIntegral y) <$> getWord64 <*> getWord8) bsrcode
+                resc' = show rcode
+                rescl = length resc'
+            in if rescl > 24 then genRcode g' else return $ Right (T.pack $ replicate (rescl - 24) '0' ++ resc', g')
+
+createProfile :: Text -> Text -> IO (Either String (SQRLProfile, RescueCode))
+createProfile name pass = profilesDirectory >>= createProfileInDir name pass
