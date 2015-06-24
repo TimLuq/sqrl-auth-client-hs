@@ -26,13 +26,18 @@ class SecureStorageEncrypted block r where
   -- | Decrypt this block type and return decrypted data.
   ssDecrypt :: Text -> block -> Maybe r
   default ssDecrypt :: Binary r => Text -> block -> Maybe r
-  ssDecrypt pass b = let pass' = Scrypt.Pass (BS.snoc (TE.encodeUtf8 pass) 0)
-                         pssky = thePassKey $ iterscrypt (ssIter b) (Scrypt.scryptParamsLen (toIntegral $ ssLogN b) 256 1 32) (ssSalt b) pass'
-                         (r, tag) = decryptGCM (initAES pssky) (ssIV b) (ssAAD b) (ssEncData b)
-                     in if toBytes tag /= ssVerTag b then Nothing
-                        else case decodeOrFail $ LBS.fromStrict r of
-                              Left _ -> error "ssDecrypt: tag matched but encrypted data is somehow corrupt."
-                              Right (_, _, r') -> Just r
+  ssDecrypt pass b = ssDecrypt' (ssIter b) (fromIntegral $ ssLogN b) (ssIV b) (ssSalt b) (ssAAD b) (ssEncData b) pass
+
+ssDecrypt' :: Word32 -> Int -> ByteString -> ByteString -> ByteString -> ByteString -> Text -> ProfilePasskey
+ssDecrypt' iter logn iv salt aad dta pass =
+  if toBytes tag /= ssVerTag b then Nothing
+  else case decodeOrFail $ LBS.fromStrict r of
+        Left _ -> error "ssDecrypt: tag matched but encrypted data is somehow corrupt."
+        Right (_, _, r') -> Just r
+  where pass' = Scrypt.Pass (BS.snoc (TE.encodeUtf8 pass) 0)
+        pssky = thePassKey $ iterscrypt iter (Scrypt.scryptParamsLen (logn) 256 1 32) salt pass'
+        (r, tag) = decryptGCM (initAES pssky) iv aad dta
+
 
 -- | A type representing an master pass key. Destroy as soon as possible.
 newtype ProfilePasskey = PassKey { thePassKey :: ByteString }
@@ -110,13 +115,16 @@ instance Binary SecureStorageBlock2Decrypted where
 
 -- | 'ssDecrypt' should be used to decrypt a 'SecureStorageBlock2' from a passphrase.
 instance SecureStorageEncrypted SecureStorageBlock2 SecureStorageBlock2Decrypted where
-  ssIV _ = BS.replicate 12 0
+  ssIV _ = emptyIV
   ssSalt = ss2ScryptSalt
   ssLogN = ss2ScryptLogN
   ssIter = ss2ScryptIter
   ssAAD _ = BS.empty
   ssEncData = ss2Encrypted
   ssVerTag = ss2VerifyTag
+
+emptyIV :: ByteString
+emptyIV = BS.replicate 12 0
 
 -- | This two-byte value contains a set of individual single-bit flags corresponding to options offered by SQRL's user-interface.
 type ClientFlags = Word16
@@ -296,7 +304,7 @@ saveSecureStorage _ = return ()
 -- > -- make a copy of the storage
 -- > openSecureStorage "original.ssss" >>= saveSecureStorage . copySecureStorage "copy.ssss" . either (\err -> error err) id
 copySecureStorage :: FilePath -> SecureStorage -> SecureStorage
-copySecureStorage fp (SecureStorage _ _ ss) = SecureStorage False fp ss
+copySecureStorage fp (SecureStorage _ _ ss) = SecureStorage True fp ss
 
 
 data SQRLProfile
@@ -319,33 +327,60 @@ listProfilesInDir dir = do
             t <- catch (getModificationTime f) (const (return 0) :: IOError -> IO UTCTime)
             return $ Just $ SQRLProfile (TE.decodeUtf8 bs) t $ openSecureStorage f
 
-listProfiles :: IO [SQRLProfile]
-listProfiles = profilesDirectory >>= listProfilesInDirs
+listProfiles :: MonadIO io => io [SQRLProfile]
+listProfiles = liftIO $ profilesDirectory >>= listProfilesInDirs
 
 profilesDirectory :: IO FilePath
 profilesDirectory = getAppUserDataDirectory $ "sqrl" ++ dirSep ++ "profiles"
 
-createProfileInDir :: Text -> Text -> FilePath -> IO (Either String (SQRLProfile, RescueCode))
-createProfileInDir name pass dir =
+data ProfileCreationError
+  = ProfileExists
+  | RandomError0 GenError
+  | RandomError1 GenError
+  deriving (Show, Eq)
+
+createProfileInDir :: Text -> Text -> Word8 -> Word16 -> Word8 -> ClientFlags -> FilePath -> IO (Either String (SQRLProfile, RescueCode))
+createProfileInDir name pass hintl hintt time flags dir =
   let f = dir ++ dirSep ++ map (toEnum . fromIntegral) $ BS.unpack $ B64U.encode $ TE.encodeUtf8 name
-  in do g <- newGenIO
-        epair <- ED25519.generateKeyPair g
-        case epair of
-         Left err -> return $ Left $ show err
-         Right (PublicKey lockkey, SecretKey unlockkey, g') -> do
-           ercode <- genRcode g'
-           case ercode of
-            Left err -> return $ Left $ show err
-            Right (rcode, _) -> undefined -- XXX: encrypt stuff and create files
-            
-  where genRcode g = genBytes 10 g >>= \x -> case x of
-          Left err -> return $ Left err
+  in doesFileExist f >>= \fx -> if fx then return $ Left "Profile already exists." else (genKeys <$> newGenIO) >>= \ekeys -> case ekeys of
+      Left err -> return $ Left $ RandomError0 err
+      Right (lockkey, unlockkey, rcode) -> (genEncParams <$> newGenIO) >>= \eencp -> case eencp of
+        Left err -> return $ Left $ RandomError1 err
+        Right (unlockKeyLogN, unlockKeyTime, idKeyLogN, idKeySalt, idKeyIV) -> do
+          let idKey = ssEnhash' unlockKey
+          (encIdKey, idKeyIter) <- encryptForSecs (fromintegral time) idKeyLogN idKeySalt idKey pass
+          (encUnlockKey, unlockKeyIter) <- encryptForSecs (fromintegral unlockKeyTime) unlockKeyLogN emptySalt unlockKey rcode
+          let (block1enc, idKeyTag) = undefined
+              block1 = SecureStorageBlock1
+               { ss1CryptoIV     = idKeyIV
+               , ss1ScryptSalt   = idKeySalt
+               , ss1ScryptLogN   = idKeyLogN
+               , ss1ScryptIter   = idKeyIter
+               , ss1Flags        = flags
+               , ss1HintLen      = hintl
+               , ss1PwVerifySec  = time
+               , ss1HintIdle     = hintt
+               , ss1PlainExtra   = BS.empty
+               , ss1Encrypted    = block1enc
+               , ss1VerifyTag    = idKeyTag
+               }
+              ss = SecureStorage True (f ++ ".ssss") [Block00001 block1, BLock00002 block2]
+          saveSecureStorage ss
+  where genKeys = case ED25519.generateKeyPair g of
+         Left err -> Left err
+         Right (PublicKey lockkey, SecretKey unlockkey, g') -> case genRcode g' of
+            Left err -> Left err
+            Right (rcode, _) -> Right (lockkey, unlockkey, rcode)
+        unlockKeyLogN = 200
+        unlockKeyIter = 800
+        genRcode g = genBytes 10 g >>= \x -> case x of
+          Left err -> Left err
           Right (bsrcode, g') ->
             let rcode :: Integral
                 rcode = runGet ((\(x, y) -> (fromIntegral x `shiftL` 8) .|. fromIntegral y) <$> getWord64 <*> getWord8) bsrcode
                 resc' = show rcode
                 rescl = length resc'
-            in if rescl > 24 then genRcode g' else return $ Right (T.pack $ replicate (rescl - 24) '0' ++ resc', g')
+            in if rescl > 24 then genRcode g' else Right (T.pack $ replicate (rescl - 24) '0' ++ resc', g')
 
-createProfile :: Text -> Text -> IO (Either String (SQRLProfile, RescueCode))
-createProfile name pass = profilesDirectory >>= createProfileInDir name pass
+createProfile :: MonadIO io => Text -> Text -> Word8 -> Word16 -> Word8 -> ClientFlags -> io (Either String (SQRLProfile, RescueCode))
+createProfile name pass hintl hintt time flags = liftIO (profilesDirectory >>= createProfileInDir name pass hintl hintt time flags)
