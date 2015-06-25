@@ -38,6 +38,10 @@ ssDecrypt' iter logn iv salt aad dta pass =
         pssky = thePassKey $ iterscrypt iter (Scrypt.scryptParamsLen (logn) 256 1 32) salt pass'
         (r, tag) = decryptGCM (initAES pssky) iv aad dta
 
+-- | Test if two bytestrings are the same in time @n@ even if the first byte are diffrent. This thwarts timing attacks unlike the builtin '(==)'.
+secureEq :: ByteString -> ByteString -> Bool
+secureEq a b = BS.length a == BS.length b &&
+               BS.length a == sum BS.zipWith (\a' b' -> if a' == b' then 1 else 0) a b
 
 -- | A type representing an master pass key. Destroy as soon as possible.
 newtype ProfilePasskey = PassKey { thePassKey :: ByteString }
@@ -339,18 +343,39 @@ data ProfileCreationError
   | RandomError1 GenError
   deriving (Show, Eq)
 
-createProfileInDir :: Text -> Text -> Word8 -> Word16 -> Word8 -> ClientFlags -> FilePath -> IO (Either String (SQRLProfile, RescueCode))
-createProfileInDir name pass hintl hintt time flags dir =
+data ProfileCreationState
+  = ProfileCreationFailed ProfileCreationError
+  | ProfileCreationSuccess (SQRLProfile, RescueCode)
+  | ProfileCreationGeneratingExternal
+  | ProfileCreationGeneratingKeys
+  | ProfileCreationGeneratingParameters
+  | ProfileCreationHashingMasterKey Int
+  | ProfileCreationEncryptingUnlock (Int, Int, Int)
+  | ProfileCreationEncryptingMaster (Int, Int, Int)
+
+-- | Get an approximate percentage for the current state. (A failed state returns @-1@.)
+profileCreationPercentage :: ProfileCreationState -> Int
+profileCreationPercentage (ProfileCreationFailed _) = -1
+profileCreationPercentage (ProfileCreationSuccess _) = 100
+profileCreationPercentage (ProfileCreationGeneratingExternal) = 1
+profileCreationPercentage (ProfileCreationGeneratingKeys) = 4
+profileCreationPercentage (ProfileCreationGeneratingParameters) = 5
+profileCreationPercentage (ProfileCreationHashingMasterKey i) = 6 + (i `shiftR` 2)
+profileCreationPercentage (ProfileCreationEncryptingUnlock (i,_,_)) = i
+profileCreationPercentage (ProfileCreationEncryptingMaster (i,_,_)) = i
+
+createProfileInDir :: (ProfileCreationState -> IO ()) -> (IO ByteString) -> Text -> Text -> HintLength -> Word16 -> PWHashingTime -> ClientFlags -> FilePath -> IO (Either ProfileCreationError (SQRLProfile, RescueCode))
+createProfileInDir callback extent name pass hintl hintt time flags dir =
   let f = dir ++ dirSep ++ map (toEnum . fromIntegral) $ BS.unpack $ B64U.encode $ TE.encodeUtf8 name
   in doesFileExist f >>= \fx -> if fx then return $ Left "Profile already exists." else (genKeys <$> newGenIO) >>= \ekeys -> case ekeys of
       Left err -> return $ Left $ RandomError0 err
       Right (lockkey, unlockkey, rcode) -> (genEncParams <$> newGenIO) >>= \eencp -> case eencp of
         Left err -> return $ Left $ RandomError1 err
-        Right (unlockKeyLogN, unlockKeyTime, idKeyLogN, idKeySalt, idKeyIV) -> do
+        Right (unlockKeySalt, unlockKeyLogN, unlockKeyTime, idKeyIV, idKeySalt, idKeyLogN) -> do
           let idKey = ssEnhash' unlockKey
           (encIdKey, idKeyIter) <- encryptForSecs (fromintegral time) idKeyLogN idKeySalt idKey pass
           (encUnlockKey, unlockKeyIter) <- encryptForSecs (fromintegral unlockKeyTime) unlockKeyLogN emptySalt unlockKey rcode
-          let (block1enc, idKeyTag) = undefined
+          let (block1enc, idKeyTag) = encryptGCM (initAES pssky) idKeyIV (ssAAD block1) encIdKey
               block1 = SecureStorageBlock1
                { ss1CryptoIV     = idKeyIV
                , ss1ScryptSalt   = idKeySalt
@@ -363,6 +388,13 @@ createProfileInDir name pass hintl hintt time flags dir =
                , ss1PlainExtra   = BS.empty
                , ss1Encrypted    = block1enc
                , ss1VerifyTag    = idKeyTag
+               }
+              block2 = SecureStorageBlock2
+               { ss2ScryptSalt   = unlockKeySalt
+               , ss2ScryptIter   = unlockKeyIter
+               , ss2ScryptLogN   = unlockKeyLogN
+               , ss2Encrypted    = block2enc
+               , ss2VerifyTag    = unlockKeyTag
                }
               ss = SecureStorage True (f ++ ".ssss") [Block00001 block1, BLock00002 block2]
           saveSecureStorage ss
@@ -382,5 +414,14 @@ createProfileInDir name pass hintl hintt time flags dir =
                 rescl = length resc'
             in if rescl > 24 then genRcode g' else Right (T.pack $ replicate (rescl - 24) '0' ++ resc', g')
 
-createProfile :: MonadIO io => Text -> Text -> Word8 -> Word16 -> Word8 -> ClientFlags -> io (Either String (SQRLProfile, RescueCode))
-createProfile name pass hintl hintt time flags = liftIO (profilesDirectory >>= createProfileInDir name pass hintl hintt time flags)
+createProfile :: (MonadIO io)
+              => (ProfileCreationState -> IO ()) -- ^ a callback which gets notified when the state changes
+              -> (IO ByteString)                 -- ^ an external source of entropy (recommended n_bytes in [4,12]), if none is available @const ByteString.empty@ should still work
+              -> Text                            -- ^ name of this profile (may not collide with another)
+              -> Text                            -- ^ password for this profile
+              -> HintLength                      -- ^ the length the password hint should be (see 'HintLength')
+              -> Word16                          -- ^ the time, in minutes, before a hint should be wiped
+              -> PWHashingTime                   -- ^ the amount of time should be spent hashing the password
+              -> ClientFlags                     -- ^ client settings for this profile
+              -> io (Either String (SQRLProfile, RescueCode))
+createProfile callback extent name pass hintl hintt time flags = liftIO (profilesDirectory >>= createProfileInDir callback extent name pass hintl hintt time flags)
