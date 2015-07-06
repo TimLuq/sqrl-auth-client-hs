@@ -4,6 +4,20 @@ module Web.Authenticate.SQRL.SecureStorage where
 import Web.Authenticate.SQRL
 import Web.Authenticate.SQRL.Client
 
+import qualified Crypto.Hash
+
+import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as LBS
+
+-- | Create a hash of the bytestring.
+sha256 :: ByteString -> ByteString
+sha256 = f . Crypto.Hash.hash
+  where f :: Crypto.Hash.Digest Crypto.Hash.SHA256 -> ByteString
+        f = toBytes
 
 -- | A general interface to all blocks containing encrypted data. This allows for the use of 'ssDecrypt' to be applied to all blocks, with the exception of 'BlockOther'.
 -- |
@@ -14,9 +28,9 @@ class SecureStorageEncrypted block r where
   -- | Initial salt for the generation of the 'ProfilePasskey'.
   ssSalt    :: block -> ByteString
   -- | Complexity of each iteration of Scrypt.
-  ssLogN    :: block -> Word8
+  ssLogN    :: block -> LogN
   -- | Iteration count for Scrypt.
-  ssIter    :: block -> Word32
+  ssIter    :: block -> ScryptIterations
   -- | Any not encrypted values which sould also be verified.
   ssAAD     :: block -> ByteString
   -- | The encrypted content to decrypt.
@@ -28,17 +42,17 @@ class SecureStorageEncrypted block r where
   default ssDecrypt :: Binary r => Text -> block -> Maybe r
   ssDecrypt pass b = ssDecrypt' (ssIter b) (fromIntegral $ ssLogN b) (ssIV b) (ssSalt b) (ssAAD b) (ssEncData b) pass
 
-ssDecrypt' :: Word32 -> Int -> ByteString -> ByteString -> ByteString -> ByteString -> Text -> ProfilePasskey
+ssDecrypt' :: ScryptIterations -> Int -> ByteString -> ByteString -> ByteString -> ByteString -> Text -> Maybe r
 ssDecrypt' iter logn iv salt aad dta pass =
   if toBytes tag /= ssVerTag b then Nothing
   else case decodeOrFail $ LBS.fromStrict r of
         Left _ -> error "ssDecrypt: tag matched but encrypted data is somehow corrupt."
         Right (_, _, r') -> Just r
   where pass' = Scrypt.Pass (BS.snoc (TE.encodeUtf8 pass) 0)
-        pssky = thePassKey $ iterscrypt iter (Scrypt.scryptParamsLen (logn) 256 1 32) salt pass'
+        pssky = thePassKey $ iterscrypt iter (Scrypt.scryptParamsLen logn 256 1 32) salt pass'
         (r, tag) = decryptGCM (initAES pssky) iv aad dta
 
--- | Test if two bytestrings are the same in time @n@ even if the first byte are diffrent. This thwarts timing attacks unlike the builtin '(==)'.
+-- | Test if two 'ByteString's are the same in time @n@ even if the first byte are diffrent. This thwarts timing attacks unlike the builtin '(==)'.
 secureEq :: ByteString -> ByteString -> Bool
 secureEq a b = BS.length a == BS.length b &&
                BS.length a == sum BS.zipWith (\a' b' -> if a' == b' then 1 else 0) a b
@@ -47,11 +61,8 @@ secureEq a b = BS.length a == BS.length b &&
 newtype ProfilePasskey = PassKey { thePassKey :: ByteString }
 
 -- | Iterate the Scrypt function to get a 'ProfilePasskey'.
-iterscrypt :: Word32 -> Scrypt.ScryptParams -> ByteString -> Scrypt.Pass -> ProfilePasskey
-iterscrypt 0 _ x _ = PassKey x
-iterscrypt i p x y = let r = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt x) y in PassKey $ iterscrypt' (i-1) r
-  where iterscrypt' 0 a = a
-        iterscrypt' n r = let r' = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt r) y in iterscrypt' (n-1) $ BS.pack $ BS.zipWith xor r r'
+iterscrypt :: ScryptIterations -> Scrypt.ScryptParams -> ByteString -> Scrypt.Pass -> ProfilePasskey
+iterscrypt i p x y = PassKey $ chain (fromIntegral i) xorBS (\a -> Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt a) y) x emptySalt
 
 -- | Type 1 - User access password authenticated & encrypted data
 --
@@ -59,17 +70,17 @@ iterscrypt i p x y = let r = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt x) y 
 -- and also contains both the plaintext and encrypted data managed by that password.
 data SecureStorageBlock1
   = SecureStorageBlock1
-    { ss1CryptoIV     :: ByteString    -- ^ init vector for auth/encrypt
-    , ss1ScryptSalt   :: ByteString    -- ^ update for password change
-    , ss1ScryptLogN   :: Word8         -- ^ memory consumption factor
-    , ss1ScryptIter   :: Word32        -- ^ time consumption factor
-    , ss1Flags        :: ClientFlags   -- ^ 16 binary flags
-    , ss1HintLen      :: HintLength    -- ^ number of chars in hint
-    , ss1PwVerifySec  :: PWHashingTime -- ^ seconds to run PW EnScrypt
-    , ss1HintIdle     :: Word16        -- ^ idle minutes before wiping PW
-    , ss1PlainExtra   :: ByteString    -- ^ extended binary data not in spec as of yet
-    , ss1Encrypted    :: ByteString    -- ^ encrypted master key, lock key, unlock key etc (see 'SecureStorageBlock1Decrypted')
-    , ss1VerifyTag    :: ByteString    -- ^ signature to validate no external changes has been made
+    { ss1CryptoIV     :: ByteString        -- ^ init vector for auth/encrypt
+    , ss1ScryptSalt   :: ByteString        -- ^ update for password change
+    , ss1ScryptLogN   :: LogN              -- ^ memory consumption factor
+    , ss1ScryptIter   :: ScryptIterations  -- ^ time consumption factor
+    , ss1Flags        :: ClientFlags       -- ^ 16 binary flags
+    , ss1HintLen      :: HintLength        -- ^ number of chars in hint
+    , ss1PwVerifySec  :: PWHashingTime     -- ^ seconds to run PW EnScrypt
+    , ss1HintIdle     :: Word16            -- ^ idle minutes before wiping PW
+    , ss1PlainExtra   :: ByteString        -- ^ extended binary data not in spec as of yet
+    , ss1Encrypted    :: ByteString        -- ^ encrypted master key, lock key, unlock key etc (see 'SecureStorageBlock1Decrypted')
+    , ss1VerifyTag    :: ByteString        -- ^ signature to validate no external changes has been made
     }
 
 -- | This is the decrypted data of 'SecureStorageBlock1' and contains decrypted keys and aditional decrypted data.
@@ -77,7 +88,7 @@ data SecureStorageBlock1Decrypted
   = SecureStorageBlock1Decrypted
     { identityMasterKey :: MasterKey   -- ^ decrypted identity master key
     , identityLockKey   :: PrivateKey  -- ^ decrypted identity lock key
-    , identityUnlockKey :: UnlockKey   -- ^ optional identity unlock key for previous identity (compare to 'emptyUnlockKey')
+    , previousUnlockKey :: UnlockKey   -- ^ optional identity unlock key for previous identity (compare to 'emptyUnlockKey')
     , ss1DecryptedExtra :: ByteString  -- ^ extended encrypted data not in spec as of yet
     }
 
@@ -98,24 +109,24 @@ instance SecureStorageEncrypted SecureStorageBlock1 SecureStorageBlock1Decrypted
 -- for use in decrypting the block's embedded encrypted emergency rescue code.
 data SecureStorageBlock2
   = SecureStorageBlock2
-    { ss2ScryptSalt   :: ByteString      -- ^ update for password change
-    , ss2ScryptLogN   :: Word8           -- ^ memory consumption factor
-    , ss2ScryptIter   :: Word32          -- ^ time consumption factor
-    , ss2Encrypted    :: ByteString      -- ^ encrypted emergency rescue code and any extended encrypted data not in spec as of yet (see 'SecreStorageBLock2Decrypted')
-    , ss2VerifyTag    :: ByteString      -- ^ signature to validate no external changes has been made
+    { ss2ScryptSalt   :: ByteString        -- ^ update for password change
+    , ss2ScryptLogN   :: LogN              -- ^ memory consumption factor
+    , ss2ScryptIter   :: ScryptIterations  -- ^ time consumption factor
+    , ss2Encrypted    :: ByteString        -- ^ encrypted emergency rescue code and any extended encrypted data not in spec as of yet (see 'SecreStorageBLock2Decrypted')
+    , ss2VerifyTag    :: ByteString        -- ^ signature to validate no external changes has been made
     }
 
 -- | This is the decrypted data of 'SecureStorageBlock2' and contains an emergency rescue code to transfer an identity.
 data SecreStorageBlock2Decrypted
   = SecureStorageBlock2Decrypted
-    { emergencyRescueCode :: RescueCode    -- ^ decrypted emergency rescue code
+    { identityUnlockKey   :: UnlockKey     -- ^ decrypted unlock key
     , ss2DecryptedExtra   :: ByteString    -- ^ extended decrypted data not in spec as of yet
     }
 
 
 instance Binary SecureStorageBlock2Decrypted where
-  put b = let (RescueCode erc) = emergencyRescueCode b in putByteString erc *> putByteString (ss2DecryptedExtra b)
-  get = SecureStorageBlock2Decrypted <$> getByteString 32 <*> (LBS.toStrict <$> getRemainingLazyByteString)
+  put b = let (UnlockKey erc) = identityUnlockKey b in putByteString erc *> putByteString (ss2DecryptedExtra b)
+  get = SecureStorageBlock2Decrypted <$> (UnlockKey <$> getByteString 32) <*> (LBS.toStrict <$> getRemainingLazyByteString)
 
 -- | 'ssDecrypt' should be used to decrypt a 'SecureStorageBlock2' from a passphrase.
 instance SecureStorageEncrypted SecureStorageBlock2 SecureStorageBlock2Decrypted where
@@ -139,6 +150,9 @@ type HintLength = Word8
 -- | This one-byte value specifies the length of time SQRL's EnScrypt function will run in order to deeply hash the user's password to generate the Identity Master Key's (IMK) symmetric key. SQRL clients are suggested to default this value to five seconds with one second as a minimum. It should not be possible for the user to circumvent at least one second of iterative hashing on any platform.
 type PWHashingTime = Word8
 
+type LogN = Word8
+type ScryptIterations = Word32
+
 -- | This requests, and gives the SQRL client permission, to briefly check-in with its publisher to see whether any updates to this software have been made available.
 clientFlagAutoUpdate :: ClientFlags
 clientFlagAutoUpdate = 0x0001
@@ -158,8 +172,8 @@ clientFlagSQRLOnly = 0x0004
 -- | This adds the @option=hardlock@ string to every client transaction. When this option string is present in any properly signed client transaction,
 -- this requests the server to set a flag in the user account that will cause the web server to subsequently disable all “out of band” (non-SQRL)
 -- account identity recovery options such as “what was your favorite pet's name.”
-clientFlagSQRLOnly :: ClientFlags
-clientFlagSQRLOnly = 0x0008
+clientFlagHardLock :: ClientFlags
+clientFlagHardLock = 0x0008
 
 -- | When set, this bit instructs the SQRL client to notify its user when the web server indicates that an IP address mismatch exists between the entity
 -- that requested the initial logon web page containing the SQRL link URL (and probably encoded into the SQRL link URL's “nut”) and the IP address
@@ -169,15 +183,15 @@ clientFlagWarnMITM = 0x0010
 
 -- | When set, this bit instructs the SQRL client to wash any existing local password and hint data from RAM upon notification that the system
 -- is going to sleep in any way such that it cannot be used. This would include sleeping, hibernating, screen blanking, etc.
-clientFlagDiscardOnBlack :: ClientFlags
-clientFlagDiscardOnBlack = 0x0020
+clientFlagClearOnBlack :: ClientFlags
+clientFlagClearOnBlack = 0x0020
 
 -- | When set, this bit instructs the SQRL client to wash any existing local password and hint data from RAM upon notification that the current user is being switched.
 --
 -- Notice: This could be interpreted as refering to the SQRL profile as in 'clientFlagNoCurrentProfile', but in actuality the "user" above is the user controlled by the OS.
 -- I could see it being used either way, though.
-clientFlagDiscardOnUserSwitch :: ClientFlags
-clientFlagDiscardOnUserSwitch = 0x0040
+clientFlagClearOnUserSwitch :: ClientFlags
+clientFlagClearOnUserSwitch = 0x0040
 
 -- | When set, this bit instructs the SQRL client to wash any existing local password and hint data from RAM when the system has been user-idle (no mouse or keyboard activity)
 -- for the number of minutes specified by the two-byte idle timeout.
@@ -185,12 +199,12 @@ clientFlagDiscardOnUserSwitch = 0x0040
 -- Notice: The idle time in 'SecureStorageBlock1' is in minutes, when time=0 then no hint is allowed. It is quite clear that this is idle system-wide and not only in usage of SQRL.
 -- But since the idle time is allowed to be more than a month;
 -- a developer could see this as clearing the hint after being idle in the sense of no SQRL authentications for the specified amounts of minutes if there is no reliable way to detect other activity.
-clientFlagDiscardOnIdle :: ClientFlags
-clientFlagDiscardOnIdle = 0x0080
+clientFlagClearOnIdle :: ClientFlags
+clientFlagClearOnIdle = 0x0080
 
 -- | The default configuration of active flags.
 --
--- > def = 'clientFlagAutoUpdate' | 'clientFlagWarnMITM' | 'clientFlagDiscardOnBlack' | 'clientFlagDiscardOnUserSwitch' | 'clientFlagDiscardOnIdle'
+-- > def = 'clientFlagAutoUpdate' | 'clientFlagWarnMITM' | 'clientFlagClearOnBlack' | 'clientFlagClearOnUserSwitch' | 'clientFlagClearOnIdle'
 clientFlagsDefault :: ClientFlags
 clientFlagsDefault = 0x00F1
 
@@ -327,9 +341,9 @@ listProfilesInDir dir = do
   catMaybes <$> mapM openProfile dd
   where openProfile d' = case (if all (\x -> x > ' ' && x < 'z') d' then B64U.decode (BS.pack $ map (fromIntegral . fromEnum) d') else Left undefined) of
           Left _ -> return Nothing
-          Right bs -> let f = dir ++ "/" ++ d' ++ ".time" in do
-            t <- catch (getModificationTime f) (const (return 0) :: IOError -> IO UTCTime)
-            return $ Just $ SQRLProfile (TE.decodeUtf8 bs) t $ openSecureStorage f
+          Right bs -> let f = dir ++ "/" ++ d' in do
+            t <- catch (getModificationTime f ++ ".time") (const (return 0) :: IOError -> IO UTCTime)
+            return $ Just $ SQRLProfile (TE.decodeUtf8 bs) t $ openSecureStorage (f  ++ ".ssss")
 
 listProfiles :: MonadIO io => io [SQRLProfile]
 listProfiles = liftIO $ profilesDirectory >>= listProfilesInDirs
@@ -364,7 +378,39 @@ profileCreationPercentage (ProfileCreationHashingMasterKey i) = 6 + (i `shiftR` 
 profileCreationPercentage (ProfileCreationEncryptingUnlock (i,_,_)) = i
 profileCreationPercentage (ProfileCreationEncryptingMaster (i,_,_)) = i
 
-createProfileInDir :: (ProfileCreationState -> IO ()) -> (IO ByteString) -> Text -> Text -> HintLength -> Word16 -> PWHashingTime -> ClientFlags -> FilePath -> IO (Either ProfileCreationError (SQRLProfile, RescueCode))
+-- | Hash a password for approximatly an amount of time (in seconds). Time varies depending on device.
+enScryptForSecs :: ((Int, Int, Int) -> IO ()) -- ^ progress callback which will be called at most once every second @(startTime, now, targetTime)@
+              -> Int                        -- ^ the amount of seconds to iterate hashing
+              -> LogN                       -- ^ the 'LogN' to be used in the hashing
+              -> ByteString                 -- ^ salt to be used
+              -> Text                       -- ^ the password to be hashed
+              -> IO (ByteString, ScryptIterations)
+enScryptForSecs f time logn salt pass = do
+  now <- secs <$> getCurrentTime
+  let r = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt salt) pass' in iterscrypt' now (now + time) r r 0 now
+  where pass' = Scrypt.Pass $ TE.encodeUtf8 pass
+        secs  = floor . utctDayTime
+        iterscrypt' :: Int -> Int -> ByteString -> ByteString -> ScryptIterations -> Int -> IO (ByteString, ScryptIterations)
+        iterscrypt' startTime targetTime salt' passon iter ltime =
+          let r = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt salt') pass'
+              r' = xorBS passon r
+              iter' = iter' + 1
+              update t = when (t /= ltime) (f (startTime, t, targetTime)) >> return t
+              next t = if t >= targetTime then return (r', iter') else iterscrypt' startTime targetTime r r' iter'
+          in seq iter' ((if iter' .&. 3 == 0 then return ltime else (secs <$> getCurrentTime) >>= update) >>= next)
+
+
+
+createProfileInDir :: (ProfileCreationState -> IO ()) -- ^ a callback which gets notified when the state changes
+                   -> IO ByteString                   -- ^ an external source of entropy (recommended n_bytes in [4,12]), if none is available @const ByteString.empty@ should still work
+                   -> Text                            -- ^ name of this profile (may not collide with another)
+                   -> Text                            -- ^ password for this profile
+                   -> HintLength                      -- ^ the length the password hint should be (see 'HintLength')
+                   -> Word16                          -- ^ the time, in minutes, before a hint should be wiped
+                   -> PWHashingTime                   -- ^ the amount of time should be spent hashing the password
+                   -> ClientFlags                     -- ^ client settings for this profile
+                   -> FilePath                        -- ^ the directory which contains the profile
+                   -> IO (Either ProfileCreationError (SQRLProfile, RescueCode))
 createProfileInDir callback extent name pass hintl hintt time flags dir =
   let f = dir ++ dirSep ++ map (toEnum . fromIntegral) $ BS.unpack $ B64U.encode $ TE.encodeUtf8 name
   in doesFileExist f >>= \fx -> if fx then return $ Left "Profile already exists." else (genKeys <$> newGenIO) >>= \ekeys -> case ekeys of
@@ -372,10 +418,11 @@ createProfileInDir callback extent name pass hintl hintt time flags dir =
       Right (lockkey, unlockkey, rcode) -> (genEncParams <$> newGenIO) >>= \eencp -> case eencp of
         Left err -> return $ Left $ RandomError1 err
         Right (unlockKeySalt, unlockKeyLogN, unlockKeyTime, idKeyIV, idKeySalt, idKeyLogN) -> do
+          (idKeyPass, idKeyIter) <- enScryptForSecs (fromintegral time) idKeyLogN idKeySalt pass
+          (unlockKeyPass, unlockKeyIter) <- enScryptForSecs (fromintegral unlockKeyTime) unlockKeyLogN emptySalt rcode
           let idKey = ssEnhash' unlockKey
-          (encIdKey, idKeyIter) <- encryptForSecs (fromintegral time) idKeyLogN idKeySalt idKey pass
-          (encUnlockKey, unlockKeyIter) <- encryptForSecs (fromintegral unlockKeyTime) unlockKeyLogN emptySalt unlockKey rcode
-          let (block1enc, idKeyTag) = encryptGCM (initAES pssky) idKeyIV (ssAAD block1) encIdKey
+              (block1enc, idKeyTag) = encryptGCM (initAES idKeyPass) idKeyIV (ssAAD block1) idKey
+              (block2enc, unlockKeyTag) = encryptGCM (initAES unlockKeyPass) emptyIV (ssAAD block2) unlockKey
               block1 = SecureStorageBlock1
                { ss1CryptoIV     = idKeyIV
                , ss1ScryptSalt   = idKeySalt
@@ -396,8 +443,10 @@ createProfileInDir callback extent name pass hintl hintt time flags dir =
                , ss2Encrypted    = block2enc
                , ss2VerifyTag    = unlockKeyTag
                }
-              ss = SecureStorage True (f ++ ".ssss") [Block00001 block1, BLock00002 block2]
+              f' = f ++ ".ssss"
+              ss = SecureStorage True f' [Block00001 block1, BLock00002 block2]
           saveSecureStorage ss
+          return $ Right (SQRLProfile { profileName = name, profileUsed = 0, profileSecureStorage = openSecureStorage f' }, rcode)
   where genKeys = case ED25519.generateKeyPair g of
          Left err -> Left err
          Right (PublicKey lockkey, SecretKey unlockkey, g') -> case genRcode g' of
@@ -414,14 +463,28 @@ createProfileInDir callback extent name pass hintl hintt time flags dir =
                 rescl = length resc'
             in if rescl > 24 then genRcode g' else Right (T.pack $ replicate (rescl - 24) '0' ++ resc', g')
 
+xorBS :: ByteString -> ByteString -> ByteString
+xorBS = BS.pack . BS.zipWith xor
+
+enHash :: ByteString -> ByteString
+enHash inp = chain 16 xorBS sha256 inp empty256
+
+-- | Do chained operations. @chain i f h a b@ means derive a new @a' = h a@ which then gets used to derive a new @b' = f a' b@. The new @a'@ and @b'@ are used recursivly for a total of @i@ times before the last @b'@ is returned.
+chain :: Int -> (a -> b -> b) -> (a -> a) -> a -> b -> b
+chain 0 _ _ _ b = b
+chain i f h a b = let { i' = i - 1 ; a' = h a ; b' = h a' b} in i' `seq` (b' `seq` chain i' f h a' b')
+
+-- | Creates a new SQRL profile. This includes generating keys, a 'RescueCode', hashing passwords and creating a 'SecureStorage'.
+--
+-- The resulting profile is returned if no error occured during the creation.
 createProfile :: (MonadIO io)
               => (ProfileCreationState -> IO ()) -- ^ a callback which gets notified when the state changes
-              -> (IO ByteString)                 -- ^ an external source of entropy (recommended n_bytes in [4,12]), if none is available @const ByteString.empty@ should still work
+              -> IO ByteString                   -- ^ an external source of entropy (recommended n_bytes in [4,12]), if none is available @const ByteString.empty@ may still be good enough
               -> Text                            -- ^ name of this profile (may not collide with another)
               -> Text                            -- ^ password for this profile
               -> HintLength                      -- ^ the length the password hint should be (see 'HintLength')
               -> Word16                          -- ^ the time, in minutes, before a hint should be wiped
               -> PWHashingTime                   -- ^ the amount of time should be spent hashing the password
               -> ClientFlags                     -- ^ client settings for this profile
-              -> io (Either String (SQRLProfile, RescueCode))
+              -> io (Either ProfileCreationError (SQRLProfile, RescueCode))
 createProfile callback extent name pass hintl hintt time flags = liftIO (profilesDirectory >>= createProfileInDir callback extent name pass hintl hintt time flags)
