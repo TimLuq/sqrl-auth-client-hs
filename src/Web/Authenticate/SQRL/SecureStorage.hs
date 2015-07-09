@@ -1,28 +1,62 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, DefaultSignatures, MultiParamTypeClasses, FunctionalDependencies #-}
 module Web.Authenticate.SQRL.SecureStorage where
 
 import Web.Authenticate.SQRL
-import Web.Authenticate.SQRL.Client
+import Web.Authenticate.SQRL.Client.Types
 
-import qualified Crypto.Hash
+import Data.Binary
+import Data.Binary.Get
+import Data.Binary.Put
+import Data.Bits
+import Data.Maybe (catMaybes, fromJust, listToMaybe)
+import Data.Time.Clock
+import Control.Applicative
+import Crypto.Random
+import Crypto.Cipher.AES
+import qualified Crypto.Hash.SHA256
+import qualified Crypto.Scrypt as Scrypt
+import qualified Crypto.Ed25519.Exceptions as ED25519
+import Control.Exception (catch)
+import Control.Monad (when)
+import Control.Monad.IO.Class (liftIO, MonadIO)
+import System.Directory (getModificationTime, getDirectoryContents, getAppUserDataDirectory, doesFileExist)
+import System.IO (IOMode(..), withBinaryFile)
+import qualified Data.ByteString.Base64.URL as B64U
 
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.ByteString (ByteString)
+import Data.Byteable
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 
+getWord64 :: Get Word64
+getWord64 = getWord64le
+putWord64 :: Word64 -> Put
+putWord64 = putWord64le
+--getWord32 :: Get Word32
+--getWord32 = getWord32le
+--putWord32 :: Word32 -> Put
+--putWord32 = putWord32le
+putWord16 :: Word16 -> Put
+putWord16 = putWord16le
+getWord16 :: Get Word16
+getWord16 = getWord16le
+
+empty256 :: ByteString
+empty256 = BS.replicate 32 0
+emptySalt :: ByteString
+emptySalt = empty256
+
 -- | Create a hash of the bytestring.
 sha256 :: ByteString -> ByteString
-sha256 = f . Crypto.Hash.hash
-  where f :: Crypto.Hash.Digest Crypto.Hash.SHA256 -> ByteString
-        f = toBytes
+sha256 = Crypto.Hash.SHA256.hash
 
 -- | A general interface to all blocks containing encrypted data. This allows for the use of 'ssDecrypt' to be applied to all blocks, with the exception of 'BlockOther'.
 -- |
 -- | Note: If all but 'ssDecrypt' are bound and the decrypted type @r@ is an instance of 'Binary' the default 'ssDecrypt' will do the job.
-class SecureStorageEncrypted block r where
+class SecureStorageEncrypted block r | block -> r where
   -- | Any IV used for encryption and verification.
   ssIV      :: block -> ByteString
   -- | Initial salt for the generation of the 'ProfilePasskey'.
@@ -40,22 +74,23 @@ class SecureStorageEncrypted block r where
   -- | Decrypt this block type and return decrypted data.
   ssDecrypt :: Text -> block -> Maybe r
   default ssDecrypt :: Binary r => Text -> block -> Maybe r
-  ssDecrypt pass b = ssDecrypt' (ssIter b) (fromIntegral $ ssLogN b) (ssIV b) (ssSalt b) (ssAAD b) (ssEncData b) pass
+  ssDecrypt pass b = ssDecrypt' (ssVerTag b) (ssIter b) (fromIntegral $ ssLogN b) (ssIV b) (ssSalt b) (ssAAD b) (ssEncData b) pass
 
-ssDecrypt' :: ScryptIterations -> Int -> ByteString -> ByteString -> ByteString -> ByteString -> Text -> Maybe r
-ssDecrypt' iter logn iv salt aad dta pass =
-  if toBytes tag /= ssVerTag b then Nothing
+ssDecrypt' :: Binary r => ByteString -> ScryptIterations -> Int -> ByteString -> ByteString -> ByteString -> ByteString -> Text -> Maybe r
+ssDecrypt' ver iter logn iv salt aad dta pass =
+  if toBytes tag /= ver then Nothing
   else case decodeOrFail $ LBS.fromStrict r of
         Left _ -> error "ssDecrypt: tag matched but encrypted data is somehow corrupt."
-        Right (_, _, r') -> Just r
+        Right (_, _, r') -> Just r'
   where pass' = Scrypt.Pass (BS.snoc (TE.encodeUtf8 pass) 0)
-        pssky = thePassKey $ iterscrypt iter (Scrypt.scryptParamsLen logn 256 1 32) salt pass'
+        p = fromJust $ Scrypt.scryptParamsLen (fromIntegral logn) 256 1 32
+        pssky = thePassKey $ iterscrypt iter p salt pass'
         (r, tag) = decryptGCM (initAES pssky) iv aad dta
 
 -- | Test if two 'ByteString's are the same in time @n@ even if the first byte are diffrent. This thwarts timing attacks unlike the builtin '(==)'.
 secureEq :: ByteString -> ByteString -> Bool
 secureEq a b = BS.length a == BS.length b &&
-               BS.length a == sum BS.zipWith (\a' b' -> if a' == b' then 1 else 0) a b
+               BS.length a == sum (BS.zipWith (\a' b' -> if a' == b' then 1 else 0) a b)
 
 -- | A type representing an master pass key. Destroy as soon as possible.
 newtype ProfilePasskey = PassKey { thePassKey :: ByteString }
@@ -86,11 +121,22 @@ data SecureStorageBlock1
 -- | This is the decrypted data of 'SecureStorageBlock1' and contains decrypted keys and aditional decrypted data.
 data SecureStorageBlock1Decrypted
   = SecureStorageBlock1Decrypted
-    { identityMasterKey :: MasterKey   -- ^ decrypted identity master key
-    , identityLockKey   :: PrivateKey  -- ^ decrypted identity lock key
-    , previousUnlockKey :: UnlockKey   -- ^ optional identity unlock key for previous identity (compare to 'emptyUnlockKey')
-    , ss1DecryptedExtra :: ByteString  -- ^ extended encrypted data not in spec as of yet
+    { identityMasterKey :: PrivateMasterKey        -- ^ decrypted identity master key
+    , identityLockKey   :: PrivateLockKey          -- ^ decrypted identity lock key
+    , previousUnlockKey :: Maybe PrivateUnlockKey  -- ^ optional identity unlock key for previous identity
+    , ss1DecryptedExtra :: ByteString              -- ^ extended encrypted data not in spec as of yet
     }
+
+
+instance Binary SecureStorageBlock1Decrypted where
+  put b = let (PrivateMasterKey pmk) = identityMasterKey b
+              (PrivateLockKey   plk) = identityLockKey   b
+              puk = case previousUnlockKey b of { Nothing -> empty256 ; Just (PrivateUnlockKey k) -> k }
+          in putByteString pmk *> putByteString plk *> putByteString puk *> putByteString (ss1DecryptedExtra b)
+  get = SecureStorageBlock1Decrypted <$> (PrivateMasterKey <$> getByteString 32) <*> (PrivateLockKey <$> getByteString 32)
+                                     <*> ((\t -> if t == empty256 then Nothing else Just (PrivateUnlockKey t)) <$> getByteString 32)
+                                     <*> (LBS.toStrict <$> getRemainingLazyByteString)
+
 
 -- | 'ssDecrypt' should be used to decrypt a 'SecureStorageBlock1' from a passphrase.
 instance SecureStorageEncrypted SecureStorageBlock1 SecureStorageBlock1Decrypted where
@@ -112,21 +158,21 @@ data SecureStorageBlock2
     { ss2ScryptSalt   :: ByteString        -- ^ update for password change
     , ss2ScryptLogN   :: LogN              -- ^ memory consumption factor
     , ss2ScryptIter   :: ScryptIterations  -- ^ time consumption factor
-    , ss2Encrypted    :: ByteString        -- ^ encrypted emergency rescue code and any extended encrypted data not in spec as of yet (see 'SecreStorageBLock2Decrypted')
+    , ss2Encrypted    :: ByteString        -- ^ encrypted emergency rescue code and any extended encrypted data not in spec as of yet (see 'SecureStorageBlock2Decrypted')
     , ss2VerifyTag    :: ByteString        -- ^ signature to validate no external changes has been made
     }
 
 -- | This is the decrypted data of 'SecureStorageBlock2' and contains an emergency rescue code to transfer an identity.
-data SecreStorageBlock2Decrypted
+data SecureStorageBlock2Decrypted
   = SecureStorageBlock2Decrypted
-    { identityUnlockKey   :: UnlockKey     -- ^ decrypted unlock key
-    , ss2DecryptedExtra   :: ByteString    -- ^ extended decrypted data not in spec as of yet
+    { identityUnlockKey   :: PrivateUnlockKey     -- ^ decrypted unlock key
+    , ss2DecryptedExtra   :: ByteString           -- ^ extended decrypted data not in spec as of yet
     }
 
 
 instance Binary SecureStorageBlock2Decrypted where
-  put b = let (UnlockKey erc) = identityUnlockKey b in putByteString erc *> putByteString (ss2DecryptedExtra b)
-  get = SecureStorageBlock2Decrypted <$> (UnlockKey <$> getByteString 32) <*> (LBS.toStrict <$> getRemainingLazyByteString)
+  put b = let (PrivateUnlockKey erc) = identityUnlockKey b in putByteString erc *> putByteString (ss2DecryptedExtra b)
+  get = SecureStorageBlock2Decrypted <$> (PrivateUnlockKey <$> getByteString 32) <*> (LBS.toStrict <$> getRemainingLazyByteString)
 
 -- | 'ssDecrypt' should be used to decrypt a 'SecureStorageBlock2' from a passphrase.
 instance SecureStorageEncrypted SecureStorageBlock2 SecureStorageBlock2Decrypted where
@@ -219,19 +265,19 @@ instance Binary SecureStorageBlock1 where
                                if ptlen < 45 then fail "Inner block to small"
                                  else if ptlen + 112 > blocklen then fail "Inner block to large to fit outer block"
                                       else SecureStorageBlock1
-                                           <$> getByteString 12 <*> getByteString 16 <*> getWord8 <*> getWord32       -- IV and scrypt params
-                                           <*> getWord16 <*> getWord8 <*> getWord16 <*> getByteString (ptlen - 45)    -- additional plain text
-                                           <*> getByteString 32 <*> getByteString 32 <*> getByteString 32             -- encrypted keys
-                                           <*> getByteString (blocklen - ptlen - 16)                                  -- all encrypted data
-                                           <*> getByteString 16                                                       -- auth tag
-  put b =  putWord16 (61 + BS.length (ss1PlainExtra b) + BS.length (ss1Encrypted b)) <*> putWord16 1 
-       <*> putWord16 (45 + BS.length (ss1PlainExtra b))
-       <*> putByteString (ss1CryptoIV b) <*> putByteString (ss1ScryptSalt b)
-       <*> putWord8 (ss1ScryptLogN b) <*> putWord32 (ss1ScryptIter b)
-       <*> putWord16 (ss1Flags b) <*> putWord8 (ss1HintLen b) <*> putWord16 (ss1HintIdle b)
-       <*> putByteString (ss1PlainExtra b)
-       <*> putByteString (ss1Encrypted b)
-       <*> putByteString (ss1VerifyTag b)
+                                           <$> getByteString 12 <*> getByteString 16 <*> getWord8 <*> getWord32                  -- IV and scrypt params
+                                           <*> getWord16 <*> getWord8 <*> getWord8 <*> getWord16                                 -- client and hashing settings
+                                           <*> getByteString (fromIntegral ptlen - 45)                                           -- additional plain text
+                                           <*> getByteString (fromIntegral $ blocklen - ptlen - 16)                              -- all encrypted data
+                                           <*> getByteString 16                                                                  -- auth tag
+  put b = putWord16 (fromIntegral $ 61 + BS.length (ss1PlainExtra b) + BS.length (ss1Encrypted b)) *> putWord16 1 
+       *> putWord16 (fromIntegral $ 45 + BS.length (ss1PlainExtra b))
+       *> putByteString (ss1CryptoIV b) *> putByteString (ss1ScryptSalt b)
+       *> putWord8 (ss1ScryptLogN b) *> putWord32 (ss1ScryptIter b)
+       *> putWord16 (ss1Flags b) *> putWord8 (ss1HintLen b) *> putWord8 (ss1PwVerifySec b) *> putWord16 (ss1HintIdle b)
+       *> putByteString (ss1PlainExtra b)
+       *> putByteString (ss1Encrypted b)
+       *> putByteString (ss1VerifyTag b)
 
 
 instance Binary SecureStorageBlock2 where
@@ -241,20 +287,20 @@ instance Binary SecureStorageBlock2 where
                      if blockt /= 2 then fail $ "Block type mismatch expected 2 got " ++ show blockt
                        else SecureStorageBlock2
                             <$> getByteString 16 <*> getWord8 <*> getWord32       -- scrypt params
-                            <*> getByteString (blocklen - 41)                     -- encrypted key and any additional encrypted data
+                            <*> getByteString (fromIntegral blocklen - 41)        -- encrypted key and any additional encrypted data
                             <*> getByteString 16                                  -- auth tag
-  put b =  putWord16 (41 + BS.length (ss2Encrypted b)) <*> putWord16 2
-       <*> putByteString (ss2ScryptSalt b)
-       <*> putWord8 (ss2ScryptLogN b) <*> putWord32 (ss2ScryptIter b)
-       <*> putByteString (ss2Encrypted b)
-       <*> putByteString (ss2VerifyTag b)
+  put b = putWord16 (41 + fromIntegral (BS.length (ss2Encrypted b))) *> putWord16 2
+       *> putByteString (ss2ScryptSalt b)
+       *> putWord8 (ss2ScryptLogN b) *> putWord32 (ss2ScryptIter b)
+       *> putByteString (ss2Encrypted b)
+       *> putByteString (ss2VerifyTag b)
 
 
 -- | A collection of related data connected to a specific SQRL profile.
-data SecureStorageBlock =
-  Block00001 SecureStorageBlock1     -- ^ The most basic of storage blocks. Contains information about master key and encryption settings.
-  Block00002 SecureStorageBlock2     -- ^ Encrypted rescue code.
-  BlockOther Int LBS.ByteString      -- ^ Any other block not supported by the specification at the time of writing, or chosen not to implement. Pull requests are welcome.
+data SecureStorageBlock
+  = Block00001 SecureStorageBlock1     -- ^ The most basic of storage blocks. Contains information about master key and encryption settings.
+  | Block00002 SecureStorageBlock2     -- ^ Encrypted rescue code.
+  | BlockOther Int LBS.ByteString      -- ^ Any other block not supported by the specification at the time of writing, or chosen not to implement. Pull requests are welcome.
 
 -- | A secure storage for a SQRL profile. Contains encrypted keys and SQRL settings.
 data SecureStorage = SecureStorage Bool String [SecureStorageBlock]
@@ -263,23 +309,29 @@ data SecureStorage = SecureStorage Bool String [SecureStorageBlock]
 secureStorageData :: SecureStorageBlock -> LBS.ByteString
 secureStorageData (Block00001 b) = encode b
 secureStorageData (Block00002 b) = encode b
-secureStorageData (BlockOther n bs) = LBS.append (runPut (putWord16 (4 + LBS.length bs) *> putWord16 n)) bs
+secureStorageData (BlockOther n bs) = LBS.append (runPut (putWord16 (4 + fromIntegral (LBS.length bs)) *> putWord16 (fromIntegral n))) bs
 
 -- | Get a structured version of the data contained by the block of type 1.
 secureStorageData1 :: SecureStorage -> Maybe SecureStorageBlock1
-secureStorageData1 (SecureStorage _ _ ss) = case find ((==) 1 . secureStorageType) ss of
+secureStorageData1 (SecureStorage _ _ ss) = case listToMaybe $ filter ((==) 1 . secureStorageType) ss of
   Just (Block00001 b) -> Just b
   _ -> Nothing
 
 -- | Get a structured version of the data contained by the block of type 2.
 secureStorageData2 :: SecureStorage -> Maybe SecureStorageBlock2
-secureStorageData2 (SecureStorage _ _ ss) = case find ((==) 2 . secureStorageType) ss of
+secureStorageData2 (SecureStorage _ _ ss) = case listToMaybe $ filter ((==) 2 . secureStorageType) ss of
   Just (Block00002 b) -> Just b
   _ -> Nothing
 
--- | Get something specific out of the 'SecureStorageBlock'. Currently only accepts first block of each type.
+-- | Get the numeric type identifier for the 'SecureStorageBlock'.
+secureStorageType :: SecureStorageBlock -> Int
+secureStorageType (Block00001 _)   = 1
+secureStorageType (Block00002 _)   = 2
+secureStorageType (BlockOther n _) = n
+
+-- | Get something specific out of the 'SecureStorageBlock'. Accepts first block of each type.
 secureStorageBlock :: Int -> SecureStorage -> Get a -> Maybe a
-secureStorageBlock bt (SecureStorage _ _ ss) f = case find ((==) bt . secureStorageType) ss of
+secureStorageBlock bt (SecureStorage _ _ ss) f = case listToMaybe $ filter ((==) bt . secureStorageType) ss of
   Nothing -> Nothing
   Just sb -> case runGetOrFail f $ secureStorageData sb of
     Left _ -> Nothing
@@ -287,21 +339,21 @@ secureStorageBlock bt (SecureStorage _ _ ss) f = case find ((==) bt . secureStor
 
 -- | Open a 'SecureStorage' contained within a 'LBS.ByteString'.
 openSecureStorage' :: String -> LBS.ByteString -> Either String SecureStorage
-openSecureStorage' fn bs = case runGet (oss []) bs of
+openSecureStorage' fn bs = case runGetOrFail (oss []) bs of
   Left (_, pos, err) -> Left $ err ++ " (at position " ++ show pos ++ ")"
-  Right (_, _, rslt) -> SecureStorage False fn $ reverse rslt
+  Right (_, _, rslt) -> Right $ SecureStorage False fn $ reverse rslt
   where oss :: [SecureStorageBlock] -> Get [SecureStorageBlock]
-        oss p = isEmpty >>= \e -> if e then p else do
+        oss p = isEmpty >>= \e -> if e then return p else do
           (l, t) <- (,) <$> getWord16 <*> getWord16
           r <- case t of
            1 -> Block00001 <$> get
            2 -> Block00002 <$> get
-           _ -> BlockOther (fromIntegral t) <$> getLazyByteString $ fromIntegral (l - 32)
+           _ -> BlockOther (fromIntegral t) <$> getLazyByteString (fromIntegral l - 32)
           let r' = r : p in seq r' $ oss r'
 
 -- | Open a 'SecureStorage' contained within a file.
 openSecureStorage :: FilePath -> IO (Either String SecureStorage)
-openSecureStorage fp = withBinaryFile fp ReadMode (openSecureStorage' <$> LBS.hGetContent)
+openSecureStorage fp = withBinaryFile fp ReadMode (fmap (openSecureStorage' fp) . LBS.hGetContents)
 
 -- | Turn a 'SecureStorage' into a lazy 'LBS.ByteString'.
 saveSecureStorage' :: SecureStorage -> LBS.ByteString
@@ -310,7 +362,7 @@ saveSecureStorage' (SecureStorage _ _ ss) = runPut $ mapM_ sss ss
         sss x = case x of
           Block00001 x'  -> put x'
           Block00002 x'  -> put x'
-          BlockOther i b -> putWord16 (fromIntegral $ LBS.length b + 32) >> putWord16 (formIntegral i) >> putLazyByteString b
+          BlockOther i b -> putWord16 (fromIntegral $ LBS.length b + 32) >> putWord16 (fromIntegral i) >> putLazyByteString b
 
 -- | Saves any changes made to the SecureStorage.
 saveSecureStorage :: SecureStorage -> IO ()
@@ -328,13 +380,15 @@ copySecureStorage fp (SecureStorage _ _ ss) = SecureStorage True fp ss
 data SQRLProfile
   = SQRLProfile
     { profileName          :: Text
-    , profileUsed          :: UTCTime
+    , profileUsed          :: Maybe UTCTime
     , profileSecureStorage :: IO (Either String SecureStorage)
     }
 
+-- | The separator to use to separate directories in paths.
 dirSep :: String
 dirSep = "/"
 
+-- | List all profiles contained within a file system directory. It's recommended to use 'listProfiles' unless there is a good reason for not using the default directory.
 listProfilesInDir :: FilePath -> IO [SQRLProfile]
 listProfilesInDir dir = do
   dd <- map (init . dropWhileEnd ('.'/=))  <$> filter (isSuffixOf ".ssss") <$> getDirectoryContents dir
@@ -342,15 +396,24 @@ listProfilesInDir dir = do
   where openProfile d' = case (if all (\x -> x > ' ' && x < 'z') d' then B64U.decode (BS.pack $ map (fromIntegral . fromEnum) d') else Left undefined) of
           Left _ -> return Nothing
           Right bs -> let f = dir ++ "/" ++ d' in do
-            t <- catch (getModificationTime f ++ ".time") (const (return 0) :: IOError -> IO UTCTime)
+            t <- catch (fmap Just $ getModificationTime $ f ++ ".time") (const (return Nothing) :: IOError -> IO (Maybe UTCTime))
             return $ Just $ SQRLProfile (TE.decodeUtf8 bs) t $ openSecureStorage (f  ++ ".ssss")
+        isSuffixOf suff txt = let sl = length suff
+                                  tl = length txt
+                              in sl <= tl && drop (tl - sl) txt == suff
+        dropWhileEnd _ "" = ""
+        dropWhileEnd f (c:cs) = let t = dropWhileEnd f cs in if null t then if f c then "" else [c] else c:t
+          
 
+-- | List all profiles which is available in the default profile directory.
 listProfiles :: MonadIO io => io [SQRLProfile]
-listProfiles = liftIO $ profilesDirectory >>= listProfilesInDirs
+listProfiles = liftIO $ profilesDirectory >>= listProfilesInDir
 
+-- | The default file system directory for profiles.
 profilesDirectory :: IO FilePath
 profilesDirectory = getAppUserDataDirectory $ "sqrl" ++ dirSep ++ "profiles"
 
+-- | ADT representing different types of errors which may occur during profile creation.
 data ProfileCreationError
   = ProfileExists
   | RandomError0 GenError
@@ -364,8 +427,8 @@ data ProfileCreationState
   | ProfileCreationGeneratingKeys
   | ProfileCreationGeneratingParameters
   | ProfileCreationHashingMasterKey Int
-  | ProfileCreationEncryptingUnlock (Int, Int, Int)
-  | ProfileCreationEncryptingMaster (Int, Int, Int)
+  | ProfileCreationEncryptingUnlock (Int, Int)
+  | ProfileCreationEncryptingMaster (Int, Int)
 
 -- | Get an approximate percentage for the current state. (A failed state returns @-1@.)
 profileCreationPercentage :: ProfileCreationState -> Int
@@ -375,34 +438,37 @@ profileCreationPercentage (ProfileCreationGeneratingExternal) = 1
 profileCreationPercentage (ProfileCreationGeneratingKeys) = 4
 profileCreationPercentage (ProfileCreationGeneratingParameters) = 5
 profileCreationPercentage (ProfileCreationHashingMasterKey i) = 6 + (i `shiftR` 2)
-profileCreationPercentage (ProfileCreationEncryptingUnlock (i,_,_)) = i
-profileCreationPercentage (ProfileCreationEncryptingMaster (i,_,_)) = i
+profileCreationPercentage (ProfileCreationEncryptingUnlock (i,_)) = i
+profileCreationPercentage (ProfileCreationEncryptingMaster (i,_)) = i
 
 -- | Hash a password for approximatly an amount of time (in seconds). Time varies depending on device.
-enScryptForSecs :: ((Int, Int, Int) -> IO ()) -- ^ progress callback which will be called at most once every second @(startTime, now, targetTime)@
+enScryptForSecs :: ((Int, Int) -> IO ())    -- ^ progress callback which will be called at most once every second @(percentage done, seconds left)@
               -> Int                        -- ^ the amount of seconds to iterate hashing
               -> LogN                       -- ^ the 'LogN' to be used in the hashing
               -> ByteString                 -- ^ salt to be used
               -> Text                       -- ^ the password to be hashed
               -> IO (ByteString, ScryptIterations)
 enScryptForSecs f time logn salt pass = do
-  now <- secs <$> getCurrentTime
-  let r = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt salt) pass' in iterscrypt' now (now + time) r r 0 now
+  now <- getCurrentTime
+  let r = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt salt) pass' in iterscrypt' now (fromIntegral time `addUTCTime` now) r r 0 now
   where pass' = Scrypt.Pass $ TE.encodeUtf8 pass
-        secs  = floor . utctDayTime
-        iterscrypt' :: Int -> Int -> ByteString -> ByteString -> ScryptIterations -> Int -> IO (ByteString, ScryptIterations)
+        p = fromJust $ Scrypt.scryptParamsLen (fromIntegral logn) 256 1 32
+        iterscrypt' :: UTCTime -> UTCTime -> ByteString -> ByteString -> ScryptIterations -> UTCTime -> IO (ByteString, ScryptIterations)
         iterscrypt' startTime targetTime salt' passon iter ltime =
           let r = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt salt') pass'
               r' = xorBS passon r
-              iter' = iter' + 1
-              update t = when (t /= ltime) (f (startTime, t, targetTime)) >> return t
-              next t = if t >= targetTime then return (r', iter') else iterscrypt' startTime targetTime r r' iter'
-          in seq iter' ((if iter' .&. 3 == 0 then return ltime else (secs <$> getCurrentTime) >>= update) >>= next)
+              iter' = iter + 1
+              spant = truncate $ targetTime `diffUTCTime` startTime 
+              update :: UTCTime -> IO UTCTime
+              update t = when (t /= ltime) (f (truncate (t `diffUTCTime` startTime) `div` spant, truncate $ targetTime `diffUTCTime` t)) >> return t
+              next :: UTCTime -> IO (ByteString, ScryptIterations)
+              next t = if t >= targetTime then return (r', iter') else iterscrypt' startTime targetTime r r' iter' t
+          in seq iter' ((if iter' .&. 3 == 0 then return ltime else getCurrentTime >>= update) >>= next)
 
 
 
 createProfileInDir :: (ProfileCreationState -> IO ()) -- ^ a callback which gets notified when the state changes
-                   -> IO ByteString                   -- ^ an external source of entropy (recommended n_bytes in [4,12]), if none is available @const ByteString.empty@ should still work
+                   -> IO [ByteString]                 -- ^ an external source of entropy (recommended minimum list length of 20 and bytestring length of 32), if none is available @return []@ should still generate an acceptable result.
                    -> Text                            -- ^ name of this profile (may not collide with another)
                    -> Text                            -- ^ password for this profile
                    -> HintLength                      -- ^ the length the password hint should be (see 'HintLength')
@@ -412,17 +478,17 @@ createProfileInDir :: (ProfileCreationState -> IO ()) -- ^ a callback which gets
                    -> FilePath                        -- ^ the directory which contains the profile
                    -> IO (Either ProfileCreationError (SQRLProfile, RescueCode))
 createProfileInDir callback extent name pass hintl hintt time flags dir =
-  let f = dir ++ dirSep ++ map (toEnum . fromIntegral) $ BS.unpack $ B64U.encode $ TE.encodeUtf8 name
-  in doesFileExist f >>= \fx -> if fx then return $ Left "Profile already exists." else (genKeys <$> newGenIO) >>= \ekeys -> case ekeys of
+  let f = (++) (dir ++ dirSep) $ map (toEnum . fromIntegral) $ BS.unpack $ B64U.encode $ TE.encodeUtf8 name
+  in doesFileExist f >>= \fx -> if fx then return $ Left ProfileExists else (genKeys <$> newGenIO <*> extent) >>= \ekeys -> case ekeys of
       Left err -> return $ Left $ RandomError0 err
-      Right (lockkey, unlockkey, rcode) -> (genEncParams <$> newGenIO) >>= \eencp -> case eencp of
+      Right (lockKey, unlockKey, rcode) -> (genEncParams <$> newGenIO) >>= \eencp -> case eencp of
         Left err -> return $ Left $ RandomError1 err
         Right (unlockKeySalt, unlockKeyLogN, unlockKeyTime, idKeyIV, idKeySalt, idKeyLogN) -> do
-          (idKeyPass, idKeyIter) <- enScryptForSecs (fromintegral time) idKeyLogN idKeySalt pass
-          (unlockKeyPass, unlockKeyIter) <- enScryptForSecs (fromintegral unlockKeyTime) unlockKeyLogN emptySalt rcode
-          let idKey = ssEnhash' unlockKey
-              (block1enc, idKeyTag) = encryptGCM (initAES idKeyPass) idKeyIV (ssAAD block1) idKey
-              (block2enc, unlockKeyTag) = encryptGCM (initAES unlockKeyPass) emptyIV (ssAAD block2) unlockKey
+          (idKeyPass, idKeyIter) <- enScryptForSecs (callback . ProfileCreationEncryptingUnlock) (fromIntegral time) idKeyLogN idKeySalt pass
+          (unlockKeyPass, unlockKeyIter) <- enScryptForSecs (callback . ProfileCreationEncryptingMaster) (fromIntegral unlockKeyTime) unlockKeyLogN emptySalt $ rescueCode rcode
+          let idKey = PrivateMasterKey $ enHash $ privateUnlockKey unlockKey
+              (block1enc, idKeyTag) = encryptGCM (initAES idKeyPass) idKeyIV (ssAAD block1) $ BS.concat [ privateMasterKey idKey, privateLockKey lockKey, empty256 ]
+              (block2enc, unlockKeyTag) = encryptGCM (initAES unlockKeyPass) emptyIV (ssAAD block2) $ privateUnlockKey unlockKey
               block1 = SecureStorageBlock1
                { ss1CryptoIV     = idKeyIV
                , ss1ScryptSalt   = idKeySalt
@@ -434,37 +500,50 @@ createProfileInDir callback extent name pass hintl hintt time flags dir =
                , ss1HintIdle     = hintt
                , ss1PlainExtra   = BS.empty
                , ss1Encrypted    = block1enc
-               , ss1VerifyTag    = idKeyTag
+               , ss1VerifyTag    = toBytes idKeyTag
                }
               block2 = SecureStorageBlock2
                { ss2ScryptSalt   = unlockKeySalt
                , ss2ScryptIter   = unlockKeyIter
                , ss2ScryptLogN   = unlockKeyLogN
                , ss2Encrypted    = block2enc
-               , ss2VerifyTag    = unlockKeyTag
+               , ss2VerifyTag    = toBytes unlockKeyTag
                }
               f' = f ++ ".ssss"
-              ss = SecureStorage True f' [Block00001 block1, BLock00002 block2]
+              ss = SecureStorage True f' [Block00001 block1, Block00002 block2]
           saveSecureStorage ss
-          return $ Right (SQRLProfile { profileName = name, profileUsed = 0, profileSecureStorage = openSecureStorage f' }, rcode)
-  where genKeys = case ED25519.generateKeyPair g of
-         Left err -> Left err
-         Right (PublicKey lockkey, SecretKey unlockkey, g') -> case genRcode g' of
-            Left err -> Left err
-            Right (rcode, _) -> Right (lockkey, unlockkey, rcode)
-        unlockKeyLogN = 200
-        unlockKeyIter = 800
-        genRcode g = genBytes 10 g >>= \x -> case x of
-          Left err -> Left err
-          Right (bsrcode, g') ->
-            let rcode :: Integral
-                rcode = runGet ((\(x, y) -> (fromIntegral x `shiftL` 8) .|. fromIntegral y) <$> getWord64 <*> getWord8) bsrcode
-                resc' = show rcode
-                rescl = length resc'
-            in if rescl > 24 then genRcode g' else Right (T.pack $ replicate (rescl - 24) '0' ++ resc', g')
+          return $ Right (SQRLProfile { profileName = name, profileUsed = Nothing, profileSecureStorage = openSecureStorage f' }, rcode)
+  where genKeys :: SystemRandom -> [ByteString] -> Either GenError (PrivateLockKey, PrivateUnlockKey, RescueCode)
+        genKeys g ntrpy = (genKeys' ntrpy . fst) <$> genBytes 128 g
+        genKeys' ntrpy genbytes =
+           let (shastate, chnks) = takeAtLeast10ButLeave10IfPossible (Crypto.Hash.SHA256.updates $ Crypto.Hash.SHA256.update Crypto.Hash.SHA256.init $ BS.take 96 genbytes) ntrpy
+               unlockKey = Crypto.Hash.SHA256.finalize shastate
+               lockKey = ED25519.exportPublic $ ED25519.generatePublic $ fromJust $ ED25519.importPrivate unlockKey
+               rcode = Crypto.Hash.SHA256.finalize $ Crypto.Hash.SHA256.updates shastate $ BS.drop 32 genbytes : chnks
+           in (PrivateLockKey lockKey, PrivateUnlockKey unlockKey, genRcode rcode)
+        takeAtLeast10ButLeave10IfPossible f x =
+          let (x0, x') = splitAt 10 x
+              (x1, x2) = splitAt 10 x'
+          in (f (x0 ++ x2), x1)
+        genEncParams :: SystemRandom -> Either GenError (ByteString, LogN, Int, ByteString, ByteString, LogN)
+        genEncParams g = (genEncParams' . fst) <$> genBytes (16 + 1 + 1 + 12 + 16 + 1) g
+        genEncParams' :: ByteString -> (ByteString, LogN, Int, ByteString, ByteString, LogN)
+        genEncParams' bs =
+          let unlockKeySalt = BS.take 16 bs
+              unlockKeyLogN = (BS.index bs 16 .&. 0x7F) + 0x23
+              unlockKeyTime = fromIntegral (complement (BS.index bs 17 .&. 0x7F)) `shiftL` 2
+              idKeyIV = BS.take 12 $ BS.drop 18 bs
+              idKeySalt = BS.take 16 $ BS.drop 30 bs
+              idKeyLogN = (BS.index bs 46 .&. 63) + 0x23
+          in (unlockKeySalt, unlockKeyLogN, unlockKeyTime, idKeyIV, idKeySalt, idKeyLogN)
+        bsToNatural :: ByteString -> Integer
+        bsToNatural = BS.foldl (\i w -> (i `shiftL` 8) + fromIntegral w) 0
+        genRcode :: ByteString -> RescueCode
+        genRcode = RescueCode . T.pack . take 24 . genRcode' . bsToNatural
+        genRcode' i = let (i', r) = i `quotRem` 10 in head (show r) : genRcode' i'
 
 xorBS :: ByteString -> ByteString -> ByteString
-xorBS = BS.pack . BS.zipWith xor
+xorBS a = BS.pack . BS.zipWith xor a
 
 enHash :: ByteString -> ByteString
 enHash inp = chain 16 xorBS sha256 inp empty256
@@ -472,14 +551,14 @@ enHash inp = chain 16 xorBS sha256 inp empty256
 -- | Do chained operations. @chain i f h a b@ means derive a new @a' = h a@ which then gets used to derive a new @b' = f a' b@. The new @a'@ and @b'@ are used recursivly for a total of @i@ times before the last @b'@ is returned.
 chain :: Int -> (a -> b -> b) -> (a -> a) -> a -> b -> b
 chain 0 _ _ _ b = b
-chain i f h a b = let { i' = i - 1 ; a' = h a ; b' = h a' b} in i' `seq` (b' `seq` chain i' f h a' b')
+chain i f h a b = let { i' = i - 1 ; a' = h a ; b' = f a' b} in i' `seq` (b' `seq` chain i' f h a' b')
 
 -- | Creates a new SQRL profile. This includes generating keys, a 'RescueCode', hashing passwords and creating a 'SecureStorage'.
 --
 -- The resulting profile is returned if no error occured during the creation.
 createProfile :: (MonadIO io)
               => (ProfileCreationState -> IO ()) -- ^ a callback which gets notified when the state changes
-              -> IO ByteString                   -- ^ an external source of entropy (recommended n_bytes in [4,12]), if none is available @const ByteString.empty@ may still be good enough
+              -> IO [ByteString]                 -- ^ an external source of entropy (recommended minimum list length of 20 and bytestring length of 32), if none is available @return []@ should still generate an acceptable result.
               -> Text                            -- ^ name of this profile (may not collide with another)
               -> Text                            -- ^ password for this profile
               -> HintLength                      -- ^ the length the password hint should be (see 'HintLength')
