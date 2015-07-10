@@ -9,6 +9,7 @@ import Data.Word (Word16)
 
 --import Crypto.Random
 import Data.ByteString (ByteString)
+import Data.Byteable
 --import qualified Data.ByteString as BS
 import Data.Text (Text)
 import Data.Maybe (fromJust)
@@ -16,6 +17,7 @@ import Data.Maybe (fromJust)
 import qualified Data.Text.Encoding as TE
 --import qualified Data.ByteString.Base64.URL as B64U
 import qualified Crypto.Ed25519.Exceptions as ED25519
+import qualified Crypto.Hash
 import Control.Applicative
 import Control.Monad.IO.Class (MonadIO)
 
@@ -74,7 +76,7 @@ class (Monad m, Functor m) => SQRLClientM clnt m | clnt -> m where
   default sqrlSign :: MonadIO m => FullRealm -> ByteString -> SQRLClient clnt m IdentitySignature
   sqrlSign = sqrlSign'
   -- | Sign blobs of data for a single domain using the previous identity.
-  sqrlSignPrevious :: FullRealm -> ByteString -> SQRLClient clnt m IdentitySignature
+  sqrlSignPrevious :: FullRealm -> ByteString -> SQRLClient clnt m (Maybe IdentitySignature)
   default sqrlSignPrevious :: MonadIO m => FullRealm -> ByteString -> SQRLClient clnt m (Maybe IdentitySignature)
   sqrlSignPrevious = sqrlSignPrevious'
   -- | The private key of the current identity for a single domain.
@@ -126,12 +128,22 @@ sqrlSignPrevious' dom bs = sqrlClient $ \s -> do
       ED25519.Sig sig = ED25519.sign bs priv pub
    in return (s', const (mkSignature sig) <$> priv')
 
--- | A partial implementation of the private key of any identity. (See 'sqrlIdentityKey' and 'sqrlIdentityKeyPrevious'.)
-sqrlIdentityKey_ :: FullRealm -> PrivateMasterKey -> DomainIdentityKey
-sqrlIdentityKey_ dom imk = 
-  let dh = enHash $ TE.encodeUtf8 dom  -- TODO: check this entire func
-      ipk = enHash $ xorBS (privateMasterKey imk) dh
-  in DomainIdentityKey ipk
+class (PrivateKey pk, DomainKey dk) => DeriveDomainKey pk dk | pk -> dk where
+  deriveDomainKey :: FullRealm -> pk -> dk
+  deriveDomainKey dom imk = mkDomainKey $ sha256hmac (privateKey imk) (TE.encodeUtf8 dom)
+
+instance DeriveDomainKey PrivateLockKey DomainLockKey
+instance DeriveDomainKey PrivateMasterKey DomainIdentityKey
+instance DeriveDomainKey PrivateUnlockKey DomainIdentityKey where
+  deriveDomainKey dom imk = deriveDomainKey dom (mkPrivateKey (enHash $ privateKey imk) :: PrivateMasterKey)
+
+
+
+-- | Create a hash of the bytestring.
+sha256hmac :: ByteString -> ByteString -> ByteString
+sha256hmac pmk = f . Crypto.Hash.hmac pmk
+  where f :: Crypto.Hash.HMAC Crypto.Hash.SHA256 -> ByteString
+        f = toBytes
 
 -- | A partial implementation of the lock key of the current identity. (See 'sqrlLockKey'.)
 sqrlLockKey_ :: FullRealm -> PrivateLockKey -> DomainLockKey
