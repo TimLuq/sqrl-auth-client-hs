@@ -1,129 +1,187 @@
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses #-}
 module Web.Authenticate.SQRL.Client.Simple where
 
 import Web.Authenticate.SQRL.Client
+import Web.Authenticate.SQRL.Client.Types
 import Web.Authenticate.SQRL.SecureStorage
 
+import Data.Word (Word16)
+import Data.Function (on)
+import Data.List (sortBy)
+import Data.Char (toLower, isUpper, isLower, isDigit, isAlphaNum)
+--import Data.Byteable
+import Data.Bits
+import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.IO as T
+--import qualified Data.Text.Encoding as TE
+import qualified System.IO as IO
+import System.IO.Unsafe (unsafePerformIO)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Lazy as LBS
+import Data.HashMap.Strict (HashMap)
+import qualified Data.HashMap.Strict as HashMap
+import Control.Concurrent.STM
+--import Control.Concurrent
+import Control.Applicative
+import Control.Monad (unless, foldM, foldM_, forM_, when, replicateM_)
+import Data.Maybe (isNothing, fromJust, isJust, fromMaybe)
+import System.Environment (getArgs)
+import System.Directory (doesFileExist, getDirectoryContents, getTemporaryDirectory)
 
+import Control.Exception (asyncExceptionFromException, bracket, catch, throwIO, SomeAsyncException, IOException)
 
-import qualified Crypto.Hash
-
+flush :: IO ()
+flush = IO.hFlush IO.stdout
 
 -- | The version of this client.
 simpleClientVersion :: Text
 simpleClientVersion = "0.0.0.0"
 
+simpleClientName :: Text
+simpleClientName = "Hasqrell Simple"
+
 -- | A 'TVar' containing the currently active user with a simplified encryption if the user has hinting allowed.
 hinted :: TVar (Maybe (Text, SecureStorageBlock1))
-hinted = newTVarIO Nothing
+{-# NOINLINE hinted #-}
+hinted = unsafePerformIO $ newTVarIO Nothing
 
 
--- | Create a hash of the bytestring.
-sha256hmac :: MasterIdentity -> ByteString -> ByteString
-sha256hmac = f . Crypto.Hash.hmac
-  where f :: Crypto.Hash.HMAC Crypto.Hash.SHA256 -> ByteString
-        f = toBytes
 
 -- | A simple client containing the current state.
 data SimpleClient
   = SimpleClient
     { selectedProfile   :: Maybe SQRLProfile
-    , masterIdentity    :: Maybe IdentityPrivateKey
-    , previousIdentity  :: Maybe IdentityPrivateKey
-    , masterLock        :: Maybe LockPrivateKey
-    , clientKeys        :: HashMap Text (IdentityPrivateKey, Maybe IdentityPrivateKey, LockPrivateKey)
+    , masterIdentity    :: Maybe PrivateMasterKey
+    , masterLock        :: Maybe PrivateLockKey
+    , previousUnlock    :: Maybe PrivateUnlockKey
+    , clientKeys        :: HashMap Text (DomainIdentityKey, DomainLockKey, Maybe DomainIdentityKey)
+    , clientError       :: Maybe ClientError
     }
-  deriving (Eq)
+
+
+emptyClient :: SimpleClient
+emptyClient = SimpleClient Nothing Nothing Nothing Nothing HashMap.empty Nothing
+
+data ClientError
+  = NoSelectedProfile
+  | SecureStorageError String
+  | DecryptError String
+  deriving (Show, Eq)
 
 instance Show SimpleClient where
   show (SimpleClient { selectedProfile = mp, masterIdentity = mi }) =
-    "SimpleClient { selectedProfile = " ++ show mp ++ ", masterIdentity = " ++
+    "SimpleClient { selectedProfileName = " ++ show (fmap profileName mp) ++ ", masterIdentity = " ++
     (case mi of { Nothing -> "Nothing" ; Just _ -> "Just <hidden-data>" }) ++
     " }"
 
 -- | The 'SimpleClient' is a SQRL client.
 instance SQRLClientM SimpleClient IO where
-  sqrlClientName _ = "Hasqrell Simple"
+  sqrlClientName _ = simpleClientName
   sqrlClientAuthor _ = "Tim Lundqvist"
   sqrlClientContact _ = "@TimLuq"
   sqrlClientVersion _ = simpleClientVersion
 
   sqrlIdentityKey dom = sqrlClient $ \s -> case HashMap.lookup dom $ clientKeys s of
     Just (k, _, _) -> return (s, k)
-    Nothing -> s `runClient` (loadKeys dom >> sqrlIdentityKey dom)
+    Nothing -> s `runClient'` (loadKeys dom >> sqrlIdentityKey dom)
   sqrlIdentityKeyPrevious dom = sqrlClient $ \s -> case HashMap.lookup dom $ clientKeys s of
-    Just (_, k, _) -> return (s, k)
-    Nothing -> s `runClient` (loadKeys dom >> sqrlIdentityKeyPrevious dom)
-  sqrlLockKey dom = sqrlClient $ \s -> case HashMap.lookup dom $ clientKeys s of
     Just (_, _, k) -> return (s, k)
-    Nothing -> s `runClient` (loadKeys dom >> sqrlLockKey dom)
+    Nothing -> s `runClient'` (loadKeys dom >> sqrlIdentityKeyPrevious dom)
+  sqrlLockKey dom = sqrlClient $ \s -> case HashMap.lookup dom $ clientKeys s of
+    Just (_, k, _) -> return (s, k)
+    Nothing -> s `runClient'` (loadKeys dom >> sqrlLockKey dom)
 
-  sqrlClearHint  = sqrlClient $ const clearHint
-  sqrlClearSensitive c = sqrlClient' $ \s -> return (s { masterIdentity = Nothing, clientKeys = HashMap.empty }, ())
+  sqrlClearHint  = sqrlClient' $ const clearHint
+  sqrlClearSensitive = sqrlClient $ \s -> return (s { masterIdentity = Nothing, masterLock = Nothing, previousUnlock = Nothing, clientKeys = HashMap.empty }, ())
+
+errorMessage :: SimpleClient -> Maybe String
+errorMessage (SimpleClient { clientError = err }) = show <$> err
 
 -- | A monadic wraper which 'fail's when an error is defined in the 'SimpleClient' (via 'clientError').
-sqrlClient_ :: SimpleClient -> (SimpleClient -> IO (SimpleClient, t)) -> SQRLClient SimpleClient IO t
-sqrlClient_ s f = case errorMessage s of
-  Just er -> fail er
-  Nothing -> sqrlClient s f >>= \r@(s', _) -> case errorMessage s' of
-    Nothing -> return r
-    Just er -> fail er
+sqrlClient_ :: (SimpleClient -> IO (SimpleClient, t)) -> SQRLClient SimpleClient IO t
+sqrlClient_ f = testFail () >> sqrlClient f >>= testFail
+  where testFail :: t -> SQRLClient SimpleClient IO t
+        testFail r = sqrlClient' $ \s' -> case errorMessage s' of
+          Nothing -> return r
+          Just er -> fail er
 
 -- | Generate keys for a specific domain and store in current session.
 -- This may cause the monad to 'fail' if the decryption is unsuccessful or no profile is selected.
-loadKeys :: Domain -> SQRLClient SimpleClient IO ()
+loadKeys :: FullRealm -> SQRLClient SimpleClient IO ()
 loadKeys dom = sqrlClient_ $ \s -> flip (,) () <$> case selectedProfile s of
-  Nothing -> s { clientError = Just NoSelectedProfile }
+  Nothing -> return s { clientError = Just NoSelectedProfile }
   Just pr -> do
     let name = profileName pr
     (s', imk, lmk, pmk) <- case masterIdentity s of
-      Just imk' -> return (s, imk', masterLock s, previousMaster s)
+      Just imk' -> return (s, imk', fromJust (masterLock s), previousUnlock s)
       Nothing   -> do
         mh <- atomically $ readTVar hinted
         if isNothing mh || fst (fromJust mh) /= name
          then profileSecureStorage pr >>= \x -> case x of
-           Left er -> return (s { clientError = SecureStorageError er }, empty256, empty256, empty256)
-           Right r -> decryptWith (password name $ secureStorageData1 r) >>= decrResult s
-         else decryptWith (passwordHint name $ snd $ fromJust mh) >>= decrResult s
+           Left er -> return (s { clientError = Just $ SecureStorageError er }, mkPrivateKey empty256, mkPrivateKey empty256, Nothing)
+           Right r -> decryptWith (password name) (fromJust $ secureStorageData1 r) >>= decrResult s
+         else decryptWith (passwordHint name) (snd $ fromJust mh) >>= decrResult s
     return $ if isJust $ clientError s' then s'
-             else let dom' = TE.encodeUtf8 dom in s' { clientKeys = HashMap.insert dom (sha256hmac imk dom', sha256 lmk dom', flip sha256hmac dom' <$> pmk) (clientKeys s') }
-  where decrResult s x1 = case x1 of
-          Left er -> return (s { clientError = DecryptError er }, empty256, empty256, empty256)
+             else s' { clientKeys = HashMap.insert dom (deriveDomainKey dom (imk :: PrivateMasterKey), deriveDomainKey dom (lmk :: PrivateLockKey), deriveDomainKey dom <$> (pmk :: Maybe PrivateUnlockKey)) (clientKeys s') }
+  where decrResult :: SimpleClient -> Either String SecureStorageBlock1Decrypted -> IO (SimpleClient, PrivateMasterKey, PrivateLockKey, Maybe PrivateUnlockKey)
+        decrResult s x1 = case x1 of
+          Left er -> return (s { clientError = Just $ DecryptError er }, mkPrivateKey empty256, mkPrivateKey empty256, Nothing)
           Right d -> let imk' = identityMasterKey d
                          lmk' = identityLockKey d
                          pmk' = previousUnlockKey d
                      in return (s { masterIdentity = Just imk', masterLock = Just lmk', previousUnlock = pmk' }, imk', lmk', pmk')
+        password :: Text -> SecureStorageBlock1 -> IO Text
+        password name _ = passinfo name >> putStr "Password: " >> flush >> T.pack <$> getPassword (-1)
+        passwordHint :: Text -> SecureStorageBlock1 -> IO Text
+        passwordHint name ss1 = passinfo name >> putStr "Password hint: " >> flush >> (T.pack . take (fromIntegral $ ss1HintLen ss1)) <$> getPassword (-1)
+        passinfo name = putStrLn "" >> putStrLn ("Using account " ++ show name ++ " to connect to " ++ show dom ++ ".") >> putStrLn ""
+        decryptWith :: (SecureStorageBlock1 -> IO Text) -> SecureStorageBlock1 -> IO (Either String SecureStorageBlock1Decrypted)
+        decryptWith f ss1 = fmap (\r -> case r of { Nothing -> Left "Wrong password." ; Just  r' -> Right r' }) (flip ssDecrypt ss1 <$> f ss1) `catch` \e ->
+          case asyncExceptionFromException e of
+           Just e' -> throwIO (e' :: SomeAsyncException)
+           Nothing -> return $ Left $ show e
 
 
--- | As with 'getLine' but with password. The integer parameter is a strength modifier which, if a natural number defines the strength of the password.
+-- | As with 'getLine' but with password. The integer parameter is a strength modifier which, if a natural number defines the strength requirement of the password.
 getPassword :: Int         -- ^ password stength modifier (negative disables, 0 normal, higher values makes it more difficult)
             -> IO String
-getPassword b = bracket (hGetEcho stdin) (hSetEcho stdin) $ const $
-  hSetEcho stdin False >> getLine >>= \p -> return p <* putStrLn $ if b >= 0 then "< " ++ show (passwordStrength b p) ++ " >" else ""
+getPassword b = bracket (IO.hGetEcho IO.stdin) (IO.hSetEcho IO.stdin) $ const $
+  IO.hSetEcho IO.stdin False >> getLine >>= \p -> putStrLn (if b >= 0 then "< " ++ show (passwordStrength b p) ++ " >" else "") >> return p
+
+data PasswordStrength
+  = BadPassword
+  | WeakPassword
+  | MediumPassword
+  | GoodPassword
+  | StrongPassword
+  deriving (Show, Eq, Enum, Ord)
 
 -- | Quick approximation of password quality.
 passwordStrength :: Int -> String -> PasswordStrength
 passwordStrength pw pass'
-  | points < 2 * pw + 10   = BadPassword
-  | points < 2 * pw + 32   = WeakPassword
-  | points < 2 * pw + 64   = MediumPassword
-  | points < 2 * pw + 128  = GoodPassword
+  | points < 2 * pw + (1 + (pw `div` 10)) * 10   = BadPassword
+  | points < 2 * pw + (1 + (pw `div` 10)) * 32   = WeakPassword
+  | points < 2 * pw + (1 + (pw `div` 10)) * 64   = MediumPassword
+  | points < 2 * pw + (1 + (pw `div` 10)) * 128  = GoodPassword
   | otherwise              = StrongPassword
   where pass = take 200 pass'
-        passl = length pass
+        countGroups :: String -> (Char -> Bool) -> Int
         countGroups x f = case span f x of
-          ("", ""  ) -> 0
-          ("", _:x') -> countGroups x' f
-          (_,  ""  ) -> 1
-          (_,  _:x') -> 1 + countGroups x' f
+          ("",  ""  ) -> 0
+          ("",  _:x') -> countGroups x' f
+          (_:_, ""  ) -> 1
+          (_:_, _:x') -> 1 + countGroups x' f
+        countConsec :: String -> (Int -> Bool) -> (Char -> Bool) -> [String]
         countConsec x s f = case span f x of
           ("", ""  ) -> []
-          ("", _:x') -> countConsec x' f
-          (r,  ""  ) -> if s r then [r] else []
-          (r,  _:x') -> if s r then r : countConsec x' s f else countConsec x' s f
+          ("", _:x') -> countConsec x' s f
+          (r,  ""  ) -> [r | (s . length) r]
+          (r,  _:x') -> if s (length r) then r : countConsec x' s f else countConsec x' s f
         points = sum
-          [ 2 * length $ take 12 pass
-          , 3 * length $ take 6 $ drop 12 pass
-          , 4 * length $ drop 18 pass
+          [ 2 * length (take 12 pass)
+          , 3 * length (take 6 $ drop 12 pass)
+          , 4 * length (drop 18 pass)
           , sum $ map ((-) 4 . (*) 2 . length) $ countConsec pass (>3) isDigit
           , sum $ map ((-) 4 . (*) 2 . length) $ countConsec pass (>3) isUpper
           , sum $ map ((-) 4 . (*) 2 . length) $ countConsec pass (>3) isLower
@@ -141,86 +199,168 @@ clearHint = atomically $ writeTVar hinted Nothing
 
 -- | This client uses 'SecureStorage' for it's profile management.
 instance SecureStorageProfile SimpleClient IO where
-  sspShowProfiles mf ps = let ps_ = sortBy (compare `on` profileUsed) ps in do
+  sspShowProfiles = showProfilesSimple
+  sspCurrentProfile = selectedProfile
+  sspCreateProfile = createProfileSimple
+
+showProfilesSimple :: Maybe (Text, SimpleClient -> IO ()) -> [SQRLProfile] -> IO ()
+showProfilesSimple mf ps = let ps_ = sortBy (compare `on` profileUsed) ps in do
     hntd <- atomically $ readTVar hinted
-    putStrLn ""
-    ps' <- foldl (\(c, l) x -> (c+1, (' ' : show c ++ " ", x) : l)) (1, []) <$> case hntd of
+    putStrLn "" >> putStrLn ("------- " ++ T.unpack (fst $ fromMaybe ("Profiles", undefined) mf) ++ " -------") >> putStrLn ""
+    ps' <- snd <$> foldl (\(c, l) x -> (c+1, (' ' : show c ++ " ", x) : l)) ((1, []) :: (Int, [(String, SQRLProfile)])) <$> ((case hntd of
       Nothing -> return $ take 8 ps_
-      Just (nm, _, _) -> putStr " 9 " >> T.putStrLn nm >> putStrLn "" >> return $ take 8 $ filter ((/=) nm . profileName) ps_
-    forM_ ps' $ \(n, p) -> putStr n >> T.putStrLn (profileName p) >> putStr "    last used: " >> putStrLn $ show $ profileUsed p
+      Just (nm, _) -> putStr " 9 " >> T.putStrLn nm >> putStrLn "" >> return (take 8 $ filter ((/=) nm . profileName) ps_)
+      ) :: IO [SQRLProfile])
+    forM_ ps' $ \(n, p) -> putStr n >> T.putStrLn (profileName p) >> putStr "    last used: " >> print (profileUsed p)
     putStrLn ""
     putStrLn " 0 - Create new profile"
     putStrLn ""
     putStr "Choice or search"
-    when (fromMaybe T.empty mf /= T.empty) (putStr " for " >> T.putStr (fromJust mf))
+    when (fst (fromMaybe (T.empty, undefined) mf) /= T.empty) (putStr " for " >> T.putStr (fst $ fromJust mf))
     putStr ": "
     flush
     r <- getLine
     case r of
-     "0" -> createProfileSimple
+     "0" -> createProfileSimple createProfile (snd $ fromMaybe (undefined, \_ -> return ()) mf) "" ""
      [x] -> if x > '0' && x <= head (show $ length ps')
-               then chooseProfileSimple $ snd $ ps' !! (fromEnum x - fromEnum '1')
+               then chooseProfileSimple mf $ snd $ ps' !! (fromEnum x - fromEnum '1')
                else sspShowProfiles mf $ filter (T.isInfixOf (T.singleton x) . profileName) ps_
      _   -> sspShowProfiles mf $ filter (T.isInfixOf (T.pack r) . profileName) ps_
-  sspCurrentProfile = selectedProfile
-  sspCreateProfile pf cf rname rpass =
-    let readString t d = putStr (concat $ (:) (' ':t) $ (if null d then id else (:) " [" . (:) d . (:) "]") [": "]) >> flush >> getLine >>= \l ->
-          if null l then if null d then return d else readString t d else return l
-        readIt :: String -> a -> (a -> Maybe String) -> IO a
-        readIt t d vf = readString t (show d) >>= \l ->
-          ( (readIO l >>= \a -> case a of { Nothing -> return a ; Just err -> putStrLn (" -- " ++ err) >> readIt t d vf })
-            <|> (putStrLn " -- invalid input value" >> readIt t d vf)
-          )
-        trim = reverse . dropWhile (' ' ==) . reverse . dropWhile (' ' ==)
-        readBool t d = readString t (if d then "True " else "False") >>= \x -> let x' = trim map toLower x in
-          if x' `elem` ["t", "true", "yes", "y", "1"] then return True
-          else if x' `elem` ["f", "false", "no", "n", "0"] then return False
-               else putStrLn " -- invalid boolean input" >> readBool t d
-    in do putStrLn ""
-          putStrLn "---- Creating a new profile ----"
-          putStrLn ""
-          name <- readString "Profile name" rname
-          pass <- readString "Password" rpass
-          hntl <- readIt "Password hint length" 4 $ \x ->
-            if x < 3 then Just "Hint must be at least 3 characters long"
-            else if x >= length pass then Just "Hint must be shorter than the password"
-                 else Nothing
-          hntt <- readIt "Password hint timeout (minutes)" 45 $ const Nothing
-          pwht <- readIt "Password hashing time (seconds)" 10 $ \x ->
-            if x < 10 then Just "With a short hashing time a brute force attack may be possible."
-            else Nothing
-          -- get client flags
-          putStrLn ""
-          putStrLn "---- Profile settings ----"
-          putStrLn ""
-          flgs <- mapM (\(f, d, t) -> readBool t d >>= \r -> if r then f else 0)
-                  [ (clientFlagAutoUpdate,        True,   "AutoUpdt | Allow client to look for updates                                   ")
-                  , (clientFlagNoCurrentProfile,  False,  "NoCurrnt | No profile is the current one, so hint is disabled                 ")
-                  , (clientFlagSQRLOnly,          False,  "SQRLOnly | Request every server to disable any other authentication methods   ")
-                  , (clientFlagHardLock,          False,  "HardLock | Request every server to disable any other account recovery methods ")
-                  , (clientFlagWarnMITM,          True,   "WarnMITM | Warn if man-in-the-middle is detected                              ")
-                  , (clientFlagClearOnBlack,      True,   "ClrBlack | Clear profile hint when detecting screensaver or suspend           ")
-                  , (clientFlagClearOnUserSwitch, True,   "ClrSwtch | Clear profile hint when switching users                            ")
-                  , (clientFlagClearOnIdle,       True,   "ClrOnIdl | Clear profile hint after the account has been idle                 ")
-                  ]
-          putStrLn ""
-          putStrLn "---- Building profile ----"
-          putStrLn ""
-          r <- pf showCreationProgress (return BS.empty) name pass hntl hntt pwht flgs
-          putStrLn ""
-          case r of
-           Left err -> putStrLn " -- Profile creation failed:" >> putStrLn (unlines $ map ((:) ' ' . (:) ' ' . (:) ' ' . (:) ' ') $ lines $ show err) >> putStrLn " -- Press enter to continue" >> getLine
-           Right (prof, rcode) -> do
-             putStrLn "---- Profile complete ----"
-             putStrLn ""
-             putStr   " Rescue code: " >> T.putStrLn rcode
-             putStrLn ""
-             putStrLn " Write the above series of numbers on a note and store it securly."
-             putStrLn " The rescue code is the only way of rekeying, and thereby regaining control, of all accounts if your master key has fallen into someone elses possession."
-             putStrLn " If possible write half the numbers on one note and store it securly at home and the other half on another note and store one copy in your wallet and the other in a vault at a bank."
-             putStrLn ""
-             putStrLn " -- Press enter after writing down the rescue code."
-             getLine 
-             cf emptyClient { selectedProfile = Just prof }
-       
 
+chooseProfileSimple :: Maybe (Text, SimpleClient -> IO ()) -> SQRLProfile -> IO ()
+chooseProfileSimple _ _ = return () -- TODO
+
+createProfileSimple :: ((ProfileCreationState -> IO ())    -- ^ a callback which gets notified when the state changes
+                        -> IO [ByteString]                 -- ^ an external source of entropy (recommended n_bytes in [4,12]), if none is available @const ByteString.empty@ may still be good enough
+                        -> Text                            -- ^ name of this profile (may not collide with another)
+                        -> Text                            -- ^ password for this profile
+                        -> HintLength                      -- ^ the length the password hint should be (see 'HintLength')
+                        -> Word16                          -- ^ the time, in minutes, before a hint should be wiped
+                        -> PWHashingTime                   -- ^ the amount of time should be spent hashing the password
+                        -> ClientFlags                     -- ^ client settings for this profile
+                        -> IO (Either ProfileCreationError (SQRLProfile, RescueCode))
+                       )              -- ^ recommended function for profile creation
+                    -> (SimpleClient -> IO ()) -- ^ action to run with the new profile
+                    -> Text           -- ^ requested profile name (MAY be overriden or confirmed)
+                    -> Password       -- ^ requested password (MAY be overriden or confirmed)
+                    -> IO ()
+createProfileSimple pf cf rname rpass =
+  let 
+  in do putStrLn ""
+        putStrLn "---- Creating a new profile ----"
+        putStrLn ""
+        name <- T.pack <$> readString "Profile name" (T.unpack rname)
+        pass <- T.pack <$> readString "Password"     (T.unpack rpass)
+        hntl <- readIt "Password hint length" 4 $ \x ->
+          if x < 3 then Just "Hint must be at least 3 characters long"
+          else if x >= T.length pass then Just "Hint must be shorter than the password"
+               else Nothing
+        hntt <- readIt "Password hint timeout (minutes)" 45 $ const Nothing
+        pwht <- readIt "Password hashing time (seconds)" 10 $ \x ->
+          if x < 10 then Just "With a short hashing time a brute force attack may be possible."
+          else Nothing
+        -- get client flags
+        putStrLn ""
+        putStrLn "---- Profile settings ----"
+        putStrLn ""
+        flgs <- foldM (\s (f, d, t) -> (\r -> if r then f .|. s else s) <$> readBool t d) 0
+                [ (clientFlagAutoUpdate,        True,   "AutoUpdt | Allow client to look for updates                                   ")
+                , (clientFlagNoCurrentProfile,  False,  "NoCurrnt | No profile is the current one, so hint is disabled                 ")
+                , (clientFlagSQRLOnly,          False,  "SQRLOnly | Request every server to disable any other authentication methods   ")
+                , (clientFlagHardLock,          False,  "HardLock | Request every server to disable any other account recovery methods ")
+                , (clientFlagWarnMITM,          True,   "WarnMITM | Warn if man-in-the-middle is detected                              ")
+                , (clientFlagClearOnBlack,      True,   "ClrBlack | Clear profile hint when detecting screensaver or suspend           ")
+                , (clientFlagClearOnUserSwitch, True,   "ClrSwtch | Clear profile hint when switching users                            ")
+                , (clientFlagClearOnIdle,       True,   "ClrOnIdl | Clear profile hint after the account has been idle                 ")
+                ]
+        putStrLn ""
+        putStrLn "---- Building profile ----"
+        putStrLn ""
+        r <- pf showCreationProgress getEntropy name pass (fromIntegral hntl) hntt pwht flgs
+        putStrLn ""
+        case r of
+         Left err -> putStrLn " -- Profile creation failed:" >> putStrLn (unlines $ map ((:) ' ' . (:) ' ' . (:) ' ' . (:) ' ') $ lines $ show err) >> putStrLn " -- Press enter to continue" >> const () <$> getLine
+         Right (prof, RescueCode rcode) -> do
+           putStrLn "---- Profile complete ----"
+           putStrLn ""
+           putStr   " Rescue code: " >> T.putStrLn rcode
+           putStrLn ""
+           putStrLn " Write the above series of numbers on a note and store it securly."
+           putStrLn " The rescue code is the only way of rekeying, and thereby regaining control, of all accounts if your master key is lost or has fallen into someone elses possession."
+           putStrLn " If possible write half the numbers on one note and store it securly at home and the other half on another note and store one copy in your wallet and the other in a vault at a bank."
+           putStrLn ""
+           putStrLn " -- Press enter after writing down the rescue code to a piece of paper."
+           _ <- getLine
+           replicateM_ 40 $ putStrLn ""
+           putStrLn " Verify your rescue code by typing it in."
+           putStr " rescue code: " >> flush
+           rcode' <- fmap T.pack getLine
+           when (rcode' /= rcode) (putStr " No. That was wrong. The correct one is: " >> T.putStrLn rcode >> putStrLn "" >> putStrLn "Press enter when you've currectly written it down." >> const () <$> getLine)
+           replicateM_ 40 $ putStrLn ""
+           cf emptyClient { selectedProfile = Just prof }
+  where getEntropy = getTemporaryDirectory >>= getDirectoryContents >>= fmap concat . mapM readIfFile
+        readIfFile fp = doesFileExist fp >>= \isFile -> if isFile then IO.withBinaryFile fp IO.ReadMode (fmap LBS.toChunks . LBS.hGetContents) `catch` ioer [] else return []
+        ioer :: r -> IOException -> IO r
+        ioer r _ = return r
+        showCreationProgress :: ProfileCreationState -> IO ()
+        showCreationProgress pcs = let prct = show $ profileCreationPercentage pcs in putStrLn  $ replicate (5 - length prct) ' ' ++ prct ++ "%    " ++ profileCreationMessage pcs
+                                                                  
+
+readString :: String -> String -> IO String
+readString t d = putStr (concat $ (:) (' ':t) $ (if null d then id else (:) " [" . (:) d . (:) "]") [": "]) >> flush >> getLine >>= \l ->
+        if null l then if null d then return d else readString t d else return l
+readIt :: (Show a, Read a) => String -> a -> (a -> Maybe String) -> IO a
+readIt t d vf = readString t (show d) >>= \l ->
+  ( (readIO l >>= \a -> case vf a of { Nothing -> return a ; Just err -> putStrLn (" -- " ++ err) >> readIt t d vf })
+    `catch` ((\d' vf' _ -> putStrLn " -- invalid input value" >> readIt t d' vf') :: (Show a, Read a) => a -> (a -> Maybe String) -> IOException -> IO a) d vf
+  )
+trim :: String -> String
+trim = reverse . dropWhile (' ' ==) . reverse . dropWhile (' ' ==)
+readBool :: String -> Bool -> IO Bool
+readBool t d = readString t (if d then "True " else "False") >>= \x -> let x' = trim $ map toLower x in
+  if x' `elem` ["t", "true", "yes", "y", "1"] then return True
+  else if x' `elem` ["f", "false", "no", "n", "0"] then return False
+       else putStrLn " -- invalid boolean input" >> readBool t d
+
+
+main :: IO ()
+main = do
+  args <- getArgs
+  case args of
+   ("import":_) -> mainImport $ tail args
+   ("sign":_)   -> mainSign $ tail args
+   ("-h":_)     -> mainHelp $ tail args
+   ("--h":_)    -> mainHelp $ tail args
+   ("--help":_) -> mainHelp $ tail args
+   ("-help":_)  -> mainHelp $ tail args
+   ("--version":_) -> mainVersion
+   ("-version":_)  -> mainVersion
+   (('q':'r':'l':':':'/':'/':_):_) -> mainSign args
+   (('s':'q':'r':'l':':':'/':'/':_):_) -> mainSign args
+   _ -> mainMenu
+
+-- | Displays the version information.
+mainVersion :: IO ()
+mainVersion = T.putStrLn $ T.unwords [simpleClientName, simpleClientVersion]
+mainImport :: [String] -> IO ()
+mainImport _ = putStrLn "Not supported yet."
+mainHelp :: [String] -> IO ()
+mainHelp _ = mainVersion >> putStrLn "" >> putStrLn "   usage:  sqrl-auth-client-simple [ SQRL-URI | sign | import ]"
+mainSign :: [String] -> IO ()
+mainSign _ = return () -- TODO
+mainMenu :: IO ()
+mainMenu = do
+  let choices = [ ("Display profiles", listProfiles >>= showProfilesSimple (Just ("Profile Management", profileManagement)))
+                , ("Enter SQRL-URI", mainSign [])
+                ]
+      choicesl = length choices
+  putStrLn "" >> putStrLn ("-------- " ++ T.unpack simpleClientName ++ " ---------") >> putStrLn ""
+  foldM_ (\n (t, _) -> const (n+1) <$> putStrLn ("  " ++ show n ++ ".  " ++ t)) (1 :: Int) choices
+  putStrLn ""
+  putStrLn "  0.  Exit"
+  putStrLn ""
+  c <- readIt "Choice" 0 $ \n -> if n `elem` [0..choicesl] then Nothing else Just "number is outside of range"
+  unless (c == 0) $ snd $ choices !! (c-1)
+
+profileManagement :: SimpleClient -> IO ()
+profileManagement _ = putStrLn "not implemented" >> mainMenu
