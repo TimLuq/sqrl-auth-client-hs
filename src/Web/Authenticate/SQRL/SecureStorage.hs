@@ -19,9 +19,10 @@ import qualified Crypto.Ed25519.Exceptions as ED25519
 import Control.Exception (catch)
 import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO, MonadIO)
-import System.Directory (getModificationTime, getDirectoryContents, getAppUserDataDirectory, doesFileExist)
+import System.Directory (getModificationTime, getDirectoryContents, getAppUserDataDirectory, doesFileExist, createDirectoryIfMissing)
 import System.IO (IOMode(..), withBinaryFile)
 import qualified Data.ByteString.Base64.URL as B64U
+import qualified Data.ByteString.Base64.URL.Lazy as LB64U
 
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -339,9 +340,14 @@ secureStorageBlock bt (SecureStorage _ _ ss) f = case listToMaybe $ filter ((==)
 
 -- | Open a 'SecureStorage' contained within a 'LBS.ByteString'.
 openSecureStorage' :: String -> LBS.ByteString -> Either String SecureStorage
-openSecureStorage' fn bs = case runGetOrFail (oss []) bs of
-  Left (_, pos, err) -> Left $ err ++ " (at position " ++ show pos ++ ")"
-  Right (_, _, rslt) -> Right $ SecureStorage False fn $ reverse rslt
+openSecureStorage' fn bs =
+  let (hdr, bs') = LBS.splitAt 8 bs
+      bs'' | hdr == "sqrldata" = Right bs'
+           | hdr == "SQRLDATA" = LB64U.decode bs'
+           | otherwise         = Left "Header mismatch"
+  in bs'' >>= \bs_ -> case runGetOrFail (oss []) bs_ of
+                       Left (_, pos, err) -> Left $ err ++ " (at position " ++ show pos ++ ")"
+                       Right (_, _, rslt) -> let slt = reverse rslt in seq slt $ Right $ SecureStorage False fn slt
   where oss :: [SecureStorageBlock] -> Get [SecureStorageBlock]
         oss p = isEmpty >>= \e -> if e then return p else do
           (l, t) <- (,) <$> getWord16 <*> getWord16
@@ -357,7 +363,7 @@ openSecureStorage fp = withBinaryFile fp ReadMode (fmap (openSecureStorage' fp) 
 
 -- | Turn a 'SecureStorage' into a lazy 'LBS.ByteString'.
 saveSecureStorage' :: SecureStorage -> LBS.ByteString
-saveSecureStorage' (SecureStorage _ _ ss) = runPut $ mapM_ sss ss
+saveSecureStorage' (SecureStorage _ _ ss) = runPut $ putByteString "sqrldata" *> mapM_ sss ss
   where sss :: SecureStorageBlock -> Put
         sss x = case x of
           Block00001 x'  -> put x'
@@ -407,7 +413,7 @@ listProfilesInDir dir = do
 
 -- | List all profiles which is available in the default profile directory.
 listProfiles :: MonadIO io => io [SQRLProfile]
-listProfiles = liftIO $ profilesDirectory >>= listProfilesInDir
+listProfiles = liftIO $ profilesDirectory >>= \d -> createDirectoryIfMissing True d >> listProfilesInDir d
 
 -- | The default file system directory for profiles.
 profilesDirectory :: IO FilePath
@@ -430,16 +436,39 @@ data ProfileCreationState
   | ProfileCreationEncryptingUnlock (Int, Int)
   | ProfileCreationEncryptingMaster (Int, Int)
 
+-- | Get a default message describing any 'ProfileCreationState'.
+profileCreationMessage :: ProfileCreationState -> String
+profileCreationMessage   (ProfileCreationFailed x)                   = "Creation failed: " ++ show x
+profileCreationMessage   (ProfileCreationSuccess (x, _))             = "Creation succeded: " ++ show (profileName x)
+profileCreationMessage   (ProfileCreationGeneratingExternal)         = "Generating external entropy"
+profileCreationMessage   (ProfileCreationGeneratingKeys)             = "Generating keys"
+profileCreationMessage   (ProfileCreationGeneratingParameters)       = "Generating parameters"
+profileCreationMessage p@(ProfileCreationHashingMasterKey _)         = "Hashing master key - " ++ show (profileCreationInternalPercentage p) ++ "%"
+profileCreationMessage p@(ProfileCreationEncryptingUnlock _)         = "Encrypting unlock key - " ++ show (profileCreationInternalPercentage p) ++ "%"
+profileCreationMessage p@(ProfileCreationEncryptingMaster _)         = "Encrypting master key - " ++ show (profileCreationInternalPercentage p) ++ "%"
+
+
+-- | Get an approximate internal percentage (0 just begun - 100 complete) of the completion for the current state.
+profileCreationInternalPercentage :: ProfileCreationState -> Int
+profileCreationInternalPercentage (ProfileCreationFailed _) = 0
+profileCreationInternalPercentage (ProfileCreationSuccess _) = 100
+profileCreationInternalPercentage (ProfileCreationGeneratingExternal) = 0
+profileCreationInternalPercentage (ProfileCreationGeneratingKeys) = 0
+profileCreationInternalPercentage (ProfileCreationGeneratingParameters) = 0
+profileCreationInternalPercentage (ProfileCreationHashingMasterKey i) = truncate (fromIntegral i / (16 :: Double))
+profileCreationInternalPercentage (ProfileCreationEncryptingUnlock (i,_)) = i
+profileCreationInternalPercentage (ProfileCreationEncryptingMaster (i,_)) = i
+
 -- | Get an approximate percentage for the current state. (A failed state returns @-1@.)
 profileCreationPercentage :: ProfileCreationState -> Int
 profileCreationPercentage (ProfileCreationFailed _) = -1
 profileCreationPercentage (ProfileCreationSuccess _) = 100
-profileCreationPercentage (ProfileCreationGeneratingExternal) = 1
-profileCreationPercentage (ProfileCreationGeneratingKeys) = 4
-profileCreationPercentage (ProfileCreationGeneratingParameters) = 5
-profileCreationPercentage (ProfileCreationHashingMasterKey i) = 6 + (i `shiftR` 2)
-profileCreationPercentage (ProfileCreationEncryptingUnlock (i,_)) = i
-profileCreationPercentage (ProfileCreationEncryptingMaster (i,_)) = i
+profileCreationPercentage (ProfileCreationGeneratingExternal) = 0
+profileCreationPercentage (ProfileCreationGeneratingKeys) = 0
+profileCreationPercentage (ProfileCreationGeneratingParameters) = 12
+profileCreationPercentage (ProfileCreationHashingMasterKey i) = 17 + (i `shiftR` 2)
+profileCreationPercentage (ProfileCreationEncryptingUnlock (i,_)) = 25 + (i `shiftR` 2)
+profileCreationPercentage (ProfileCreationEncryptingMaster (i,_)) = 75 + (i `div` 5)
 
 -- | Hash a password for approximatly an amount of time (in seconds). Time varies depending on device.
 enScryptForSecs :: ((Int, Int) -> IO ())    -- ^ progress callback which will be called at most once every second @(percentage done, seconds left)@
