@@ -1,28 +1,34 @@
-{-# LANGUAGE OverloadedStrings, DefaultSignatures, MultiParamTypeClasses, FunctionalDependencies #-}
+{-# LANGUAGE OverloadedStrings, DefaultSignatures, MultiParamTypeClasses, FunctionalDependencies, ForeignFunctionInterface #-}
 module Web.Authenticate.SQRL.SecureStorage where
 
-import Web.Authenticate.SQRL
+import Web.Authenticate.SQRL.Types
 import Web.Authenticate.SQRL.Client.Types
 
 import Data.Binary
 import Data.Binary.Get
 import Data.Binary.Put
 import Data.Bits
+import Data.Int (Int32)
+import Data.IORef
 import Data.Maybe (catMaybes, fromJust, listToMaybe)
 import Data.Time.Clock
 import Control.Applicative
 import Crypto.Random
 import Crypto.Cipher.AES
 import qualified Crypto.Hash.SHA256
-import qualified Crypto.Scrypt as Scrypt
+import qualified Crypto.Scrypt as Scrypt () --- needed for its c-files
 import qualified Crypto.Ed25519.Exceptions as ED25519
 import Control.Exception (catch)
-import Control.Monad (when)
+--import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO, MonadIO)
 import System.Directory (getModificationTime, getDirectoryContents, getAppUserDataDirectory, doesFileExist, createDirectoryIfMissing)
 import System.IO (IOMode(..), withBinaryFile)
 import qualified Data.ByteString.Base64.URL as B64U
 import qualified Data.ByteString.Base64.URL.Lazy as LB64U
+
+--import Control.Concurrent (runInBoundThread)
+import System.IO.Unsafe (unsafePerformIO)
+import Control.DeepSeq
 
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -30,7 +36,13 @@ import qualified Data.Text.Encoding as TE
 import Data.ByteString (ByteString)
 import Data.Byteable
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BS (unsafeUseAsCStringLen)
 import qualified Data.ByteString.Lazy as LBS
+
+import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Ptr (FunPtr, Ptr, castPtr)
+import Foreign.C.Types (CInt(..), CSize(..))
+
 
 getWord64 :: Get Word64
 getWord64 = getWord64le
@@ -77,15 +89,13 @@ class SecureStorageEncrypted block r | block -> r where
   default ssDecrypt :: Binary r => Text -> block -> Maybe r
   ssDecrypt pass b = ssDecrypt' (ssVerTag b) (ssIter b) (fromIntegral $ ssLogN b) (ssIV b) (ssSalt b) (ssAAD b) (ssEncData b) pass
 
-ssDecrypt' :: Binary r => ByteString -> ScryptIterations -> Int -> ByteString -> ByteString -> ByteString -> ByteString -> Text -> Maybe r
+ssDecrypt' :: Binary r => ByteString -> ScryptIterations -> LogN -> ByteString -> ByteString -> ByteString -> ByteString -> Text -> Maybe r
 ssDecrypt' ver iter logn iv salt aad dta pass =
   if toBytes tag /= ver then Nothing
   else case decodeOrFail $ LBS.fromStrict r of
-        Left _ -> error "ssDecrypt: tag matched but encrypted data is somehow corrupt."
+        Left err -> error $ "ssDecrypt: tag matched but encrypted data is somehow corrupt (" ++ show err ++ ")."
         Right (_, _, r') -> Just r'
-  where pass' = Scrypt.Pass (BS.snoc (TE.encodeUtf8 pass) 0)
-        p = fromJust $ Scrypt.scryptParamsLen (fromIntegral logn) 256 1 32
-        pssky = thePassKey $ iterscrypt iter p salt pass'
+  where pssky = enScrypt iter logn salt pass
         (r, tag) = decryptGCM (initAES pssky) iv aad dta
 
 -- | Test if two 'ByteString's are the same in time @n@ even if the first byte are diffrent. This thwarts timing attacks unlike the builtin '(==)'.
@@ -96,9 +106,11 @@ secureEq a b = BS.length a == BS.length b &&
 -- | A type representing an master pass key. Destroy as soon as possible.
 newtype ProfilePasskey = PassKey { thePassKey :: ByteString }
 
+{-
 -- | Iterate the Scrypt function to get a 'ProfilePasskey'.
 iterscrypt :: ScryptIterations -> Scrypt.ScryptParams -> ByteString -> Scrypt.Pass -> ProfilePasskey
 iterscrypt i p x y = PassKey $ chain (fromIntegral i) xorBS (\a -> Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt a) y) x emptySalt
+-}
 
 -- | Type 1 - User access password authenticated & encrypted data
 --
@@ -128,6 +140,21 @@ data SecureStorageBlock1Decrypted
     , ss1DecryptedExtra :: ByteString              -- ^ extended encrypted data not in spec as of yet
     }
 
+instance NFData SecureStorageBlock1 where
+  rnf SecureStorageBlock1
+      { ss1CryptoIV   = iv
+      , ss1ScryptSalt = sa
+      , ss1ScryptLogN = ln 
+      , ss1ScryptIter = si
+      , ss1Flags      = cf
+      , ss1HintLen    = hl
+      , ss1PwVerifySec= ht
+      , ss1HintIdle   = hi
+      , ss1PlainExtra = px
+      , ss1Encrypted  = ec
+      , ss1VerifyTag  = tg
+      } = rnf iv `seq` rnf sa `seq` rnf ln `seq` rnf si `seq` rnf cf `seq` rnf hl `seq` rnf ht `seq` rnf hi `seq` rnf px `seq` rnf ec `seq` rnf tg `seq` ()
+
 
 instance Binary SecureStorageBlock1Decrypted where
   put b = let (PrivateMasterKey pmk) = identityMasterKey b
@@ -145,7 +172,7 @@ instance SecureStorageEncrypted SecureStorageBlock1 SecureStorageBlock1Decrypted
   ssSalt = ss1ScryptSalt
   ssLogN = ss1ScryptLogN
   ssIter = ss1ScryptIter
-  ssAAD x = runGet (lookAhead (skip 32 *> getWord16) >>= getByteString . fromIntegral) (encode x)
+  ssAAD x = let x' = encode x in runGet (lookAhead (skip 4 *> getWord16) >>= getByteString . fromIntegral) x'
   ssEncData = ss1Encrypted
   ssVerTag = ss1VerifyTag
 
@@ -169,6 +196,17 @@ data SecureStorageBlock2Decrypted
     { identityUnlockKey   :: PrivateUnlockKey     -- ^ decrypted unlock key
     , ss2DecryptedExtra   :: ByteString           -- ^ extended decrypted data not in spec as of yet
     }
+
+
+
+instance NFData SecureStorageBlock2 where
+  rnf SecureStorageBlock2
+      { ss2ScryptSalt = sa
+      , ss2ScryptLogN = ln 
+      , ss2ScryptIter = si
+      , ss2Encrypted  = ec
+      , ss2VerifyTag  = tg
+      } = rnf sa `seq` rnf ln `seq` rnf si `seq` rnf ec `seq` rnf tg `seq` ()
 
 
 instance Binary SecureStorageBlock2Decrypted where
@@ -350,16 +388,19 @@ openSecureStorage' fn bs =
                        Right (_, _, rslt) -> let slt = reverse rslt in seq slt $ Right $ SecureStorage False fn slt
   where oss :: [SecureStorageBlock] -> Get [SecureStorageBlock]
         oss p = isEmpty >>= \e -> if e then return p else do
-          (l, t) <- (,) <$> getWord16 <*> getWord16
+          (l, t) <- lookAhead $ (,) <$> getWord16 <*> getWord16
           r <- case t of
            1 -> Block00001 <$> get
            2 -> Block00002 <$> get
-           _ -> BlockOther (fromIntegral t) <$> getLazyByteString (fromIntegral l - 32)
+           _ -> BlockOther (fromIntegral t) <$> (skip 32 *> getLazyByteString (fromIntegral l - 32))
           let r' = r : p in seq r' $ oss r'
 
 -- | Open a 'SecureStorage' contained within a file.
 openSecureStorage :: FilePath -> IO (Either String SecureStorage)
-openSecureStorage fp = withBinaryFile fp ReadMode (fmap (openSecureStorage' fp) . LBS.hGetContents)
+openSecureStorage fp = do
+  var <- newIORef $ Left "Nothing read from SecureStorage"
+  withBinaryFile fp ReadMode (\h -> fmap (openSecureStorage' fp) (LBS.hGetContents h) >>= \r -> writeIORef var $! r)
+  readIORef var
 
 -- | Turn a 'SecureStorage' into a lazy 'LBS.ByteString'.
 saveSecureStorage' :: SecureStorage -> LBS.ByteString
@@ -394,6 +435,11 @@ data SQRLProfile
 dirSep :: String
 dirSep = "/"
 
+profilePath :: Text -> IO (Either FilePath FilePath)
+profilePath n = let n' = T.unpack $ TE.decodeUtf8 $ B64U.encode $ TE.encodeUtf8 n in profilesDirectory >>= \d ->
+  let f = d ++ dirSep ++ n' ++ ".ssss"
+  in createDirectoryIfMissing True d >> fmap (\b -> if b then Right f else Left f) (doesFileExist f)
+
 -- | List all profiles contained within a file system directory. It's recommended to use 'listProfiles' unless there is a good reason for not using the default directory.
 listProfilesInDir :: FilePath -> IO [SQRLProfile]
 listProfilesInDir dir = do
@@ -401,13 +447,13 @@ listProfilesInDir dir = do
   catMaybes <$> mapM openProfile dd
   where openProfile d' = case (if all (\x -> x > ' ' && x < 'z') d' then B64U.decode (BS.pack $ map (fromIntegral . fromEnum) d') else Left undefined) of
           Left _ -> return Nothing
-          Right bs -> let f = dir ++ "/" ++ d' in do
+          Right bs -> let f = dir ++ dirSep ++ d' in do
             t <- catch (fmap Just $ getModificationTime $ f ++ ".time") (const (return Nothing) :: IOError -> IO (Maybe UTCTime))
             return $ Just $ SQRLProfile (TE.decodeUtf8 bs) t $ openSecureStorage (f  ++ ".ssss")
         isSuffixOf suff txt = let sl = length suff
                                   tl = length txt
                               in sl <= tl && drop (tl - sl) txt == suff
-        dropWhileEnd _ "" = ""
+        dropWhileEnd _ [] = ""
         dropWhileEnd f (c:cs) = let t = dropWhileEnd f cs in if null t then if f c then "" else [c] else c:t
           
 
@@ -433,8 +479,8 @@ data ProfileCreationState
   | ProfileCreationGeneratingKeys
   | ProfileCreationGeneratingParameters
   | ProfileCreationHashingMasterKey Int
-  | ProfileCreationEncryptingUnlock (Int, Int)
-  | ProfileCreationEncryptingMaster (Int, Int)
+  | ProfileCreationEncryptingUnlock (Int, Int, Int)
+  | ProfileCreationEncryptingMaster (Int, Int, Int)
 
 -- | Get a default message describing any 'ProfileCreationState'.
 profileCreationMessage :: ProfileCreationState -> String
@@ -456,8 +502,8 @@ profileCreationInternalPercentage (ProfileCreationGeneratingExternal) = 0
 profileCreationInternalPercentage (ProfileCreationGeneratingKeys) = 0
 profileCreationInternalPercentage (ProfileCreationGeneratingParameters) = 0
 profileCreationInternalPercentage (ProfileCreationHashingMasterKey i) = truncate (fromIntegral i / (16 :: Double))
-profileCreationInternalPercentage (ProfileCreationEncryptingUnlock (i,_)) = i
-profileCreationInternalPercentage (ProfileCreationEncryptingMaster (i,_)) = i
+profileCreationInternalPercentage (ProfileCreationEncryptingUnlock (i,_,_)) = i
+profileCreationInternalPercentage (ProfileCreationEncryptingMaster (i,_,_)) = i
 
 -- | Get an approximate percentage for the current state. (A failed state returns @-1@.)
 profileCreationPercentage :: ProfileCreationState -> Int
@@ -467,17 +513,67 @@ profileCreationPercentage (ProfileCreationGeneratingExternal) = 0
 profileCreationPercentage (ProfileCreationGeneratingKeys) = 0
 profileCreationPercentage (ProfileCreationGeneratingParameters) = 12
 profileCreationPercentage (ProfileCreationHashingMasterKey i) = 17 + (i `shiftR` 2)
-profileCreationPercentage (ProfileCreationEncryptingUnlock (i,_)) = 25 + (i `shiftR` 2)
-profileCreationPercentage (ProfileCreationEncryptingMaster (i,_)) = 75 + (i `div` 5)
+profileCreationPercentage (ProfileCreationEncryptingUnlock (i,_,_)) = 25 + (i `shiftR` 2)
+profileCreationPercentage (ProfileCreationEncryptingMaster (i,_,_)) = 75 + (i `div` 5)
+
+
+-- a "wrapper" import gives a factory for converting a Haskell function to a foreign function pointer
+foreign import ccall "wrapper"
+  enscryptwrap :: (CInt -> Int32 -> Int32 -> IO ()) -> IO (FunPtr (CInt -> Int32 -> Int32 -> IO ()))
+
+-- import the foreign function as normal
+foreign import ccall safe "enscrypt.h sqrl_enscrypt_time"
+  c_sqrl_enscrypt_time :: FunPtr (CInt -> Int32 -> Int32 -> IO ()) -> Int32 -> Word8
+                       -> Ptr Word8 -> CSize -> Ptr Word8 -> CSize
+                       -> Ptr Word8 -> CSize -> IO Word32
+
+-- import the foreign function as normal
+foreign import ccall safe "enscrypt.h sqrl_enscrypt_iter"
+  c_sqrl_enscrypt_iter :: Word32 -> Word8
+                       -> Ptr Word8 -> CSize -> Ptr Word8 -> CSize
+                       -> Ptr Word8 -> CSize -> IO Word32
+
+
+-- | Hash a password for a number of times
+enScrypt :: ScryptIterations           -- ^ the amount of iterations
+         -> LogN                       -- ^ the 'LogN' to be used in the hashing
+         -> ByteString                 -- ^ salt to be used
+         -> Text                       -- ^ the password to be hashed
+         -> ByteString
+enScrypt iters logn salt pass = unsafePerformIO $
+  BS.unsafeUseAsCStringLen salt $ \(salt', saltlen) ->
+    BS.unsafeUseAsCStringLen (TE.encodeUtf8 pass) $ \(pass', passlen) ->
+      allocaBytes (fromIntegral bufflen) $ \buff' -> do
+        putStrLn $ "TRACE: Calling out to EnScrypt for " ++ show iters ++ " iterations..."
+        r <-
+          --runInBoundThread $
+          c_sqrl_enscrypt_iter (fromIntegral iters) (fromIntegral logn) (castPtr salt') (fromIntegral saltlen) (castPtr pass') (fromIntegral passlen) (castPtr buff') (fromIntegral bufflen)
+        putStrLn "TRACE: Calling out to EnScrypt done."
+        if r < 0 then fail "enScrypt: enscrypt failed." else BS.packCStringLen (buff', bufflen)
+  where bufflen = 32
 
 -- | Hash a password for approximatly an amount of time (in seconds). Time varies depending on device.
-enScryptForSecs :: ((Int, Int) -> IO ())    -- ^ progress callback which will be called at most once every second @(percentage done, seconds left)@
+enScryptForSecs :: ((Int, Int, Int) -> IO ())    -- ^ progress callback which will be called at most once every second @(percentage done, seconds left)@
               -> Int                        -- ^ the amount of seconds to iterate hashing
               -> LogN                       -- ^ the 'LogN' to be used in the hashing
               -> ByteString                 -- ^ salt to be used
               -> Text                       -- ^ the password to be hashed
               -> IO (ByteString, ScryptIterations)
 enScryptForSecs f time logn salt pass = do
+  putStrLn "TRACE: enScryptForSecs wrapping callback..."
+  callback <- enscryptwrap (\a b c -> f (fromIntegral a, fromIntegral b, fromIntegral c))
+  putStrLn "TRACE: enScryptForSecs wrapping complete."
+  BS.unsafeUseAsCStringLen salt $ \(salt', saltlen) ->
+    BS.unsafeUseAsCStringLen (TE.encodeUtf8 pass) $ \(pass', passlen) ->
+      allocaBytes (fromIntegral bufflen) $ \buff' -> do
+        putStrLn $ "TRACE: Calling out to EnScrypt for " ++ show time ++ "s..."
+        r <-
+          --runInBoundThread $
+          c_sqrl_enscrypt_time callback (fromIntegral time) (fromIntegral logn) (castPtr salt') (fromIntegral saltlen) (castPtr pass') (fromIntegral passlen) (castPtr buff') (fromIntegral bufflen)
+        putStrLn $ "TRACE: Calling out to EnScrypt lasted " ++ show r ++ " iterations."
+        if r < 0 then fail "enScryptForSecs: enscrypt failed." else (\x -> (x, fromIntegral r)) <$> BS.packCStringLen (buff', bufflen)
+  where bufflen = 32
+{- -- This is too slow. It uses too much RAM constructing ADTs.
   now <- getCurrentTime
   let r = Scrypt.getHash $ Scrypt.scrypt p (Scrypt.Salt salt) pass' in iterscrypt' now (fromIntegral time `addUTCTime` now) r r 0 now
   where pass' = Scrypt.Pass $ TE.encodeUtf8 pass
@@ -489,15 +585,29 @@ enScryptForSecs f time logn salt pass = do
               iter' = iter + 1
               spant = truncate $ targetTime `diffUTCTime` startTime 
               update :: UTCTime -> IO UTCTime
-              update t = when (t /= ltime) (f (truncate (t `diffUTCTime` startTime) `div` spant, truncate $ targetTime `diffUTCTime` t)) >> return t
+              update t = if truncate (t `diffUTCTime` ltime) /= (0 :: Int) then f ((100 * truncate (t `diffUTCTime` startTime)) `div` spant, truncate $ targetTime `diffUTCTime` t) >> return t else return ltime
               next :: UTCTime -> IO (ByteString, ScryptIterations)
               next t = if t >= targetTime then return (r', iter') else iterscrypt' startTime targetTime r r' iter' t
-          in seq iter' ((if iter' .&. 3 == 0 then return ltime else getCurrentTime >>= update) >>= next)
+          in seq iter' ((if iter' .&. 3 /= 0 then return ltime else getCurrentTime >>= update) >>= next)
+-}
 
 
+-- TODO: temove trace
+{-# INLINE pe #-}
+pe :: NFData a => String -> a -> a
+pe s a = let
+  b = unsafePerformIO (putStrLn $ "TRACE> Evaluating " ++ s) `deepseq` a
+  c = b `deepseq` unsafePerformIO (putStrLn $ "TRACE< Evaluated " ++ s)
+  in c `deepseq` b
+
+
+
+data SQRLEntropy
+  = NoEntropy
+  | SQRLEntropy [ByteString] (IO SQRLEntropy)
 
 createProfileInDir :: (ProfileCreationState -> IO ()) -- ^ a callback which gets notified when the state changes
-                   -> IO [ByteString]                 -- ^ an external source of entropy (recommended minimum list length of 20 and bytestring length of 32), if none is available @return []@ should still generate an acceptable result.
+                   -> IO SQRLEntropy                  -- ^ an external source of entropy (recommended minimum list length of 20 and bytestring length of 32), if none is available @return 'NoEntropy'@ should still generate an acceptable result.
                    -> Text                            -- ^ name of this profile (may not collide with another)
                    -> Text                            -- ^ password for this profile
                    -> HintLength                      -- ^ the length the password hint should be (see 'HintLength')
@@ -508,68 +618,88 @@ createProfileInDir :: (ProfileCreationState -> IO ()) -- ^ a callback which gets
                    -> IO (Either ProfileCreationError (SQRLProfile, RescueCode))
 createProfileInDir callback extent name pass hintl hintt time flags dir =
   let f = (++) (dir ++ dirSep) $ map (toEnum . fromIntegral) $ BS.unpack $ B64U.encode $ TE.encodeUtf8 name
-  in doesFileExist f >>= \fx -> if fx then return $ Left ProfileExists else (genKeys <$> newGenIO <*> extent) >>= \ekeys -> case ekeys of
+  in doesFileExist f >>= \fx -> if fx then return $ Left ProfileExists else (flip genKeys extent <$> newGenIO) >>= \ekeys -> case ekeys of
       Left err -> return $ Left $ RandomError0 err
-      Right (lockKey, unlockKey, rcode) -> (genEncParams <$> newGenIO) >>= \eencp -> case eencp of
+      Right iof -> putStrLn "TRACE: Generating keys." >> iof >>= \(lockKey, unlockKey, rcode) -> putStrLn "TRACE: Generating params." >> (genEncParams <$> newGenIO) >>= \eencp -> case eencp of
         Left err -> return $ Left $ RandomError1 err
         Right (unlockKeySalt, unlockKeyLogN, unlockKeyTime, idKeyIV, idKeySalt, idKeyLogN) -> do
-          (idKeyPass, idKeyIter) <- enScryptForSecs (callback . ProfileCreationEncryptingUnlock) (fromIntegral time) idKeyLogN idKeySalt pass
-          (unlockKeyPass, unlockKeyIter) <- enScryptForSecs (callback . ProfileCreationEncryptingMaster) (fromIntegral unlockKeyTime) unlockKeyLogN emptySalt $ rescueCode rcode
+          putStrLn "TRACE: All random data gathered and allocated."
+          (unlockKeyPass, unlockKeyIter) <- enScryptForSecs (callback . ProfileCreationEncryptingUnlock) (fromIntegral unlockKeyTime) unlockKeyLogN emptySalt $ rescueCode rcode
+          (idKeyPass, idKeyIter) <- enScryptForSecs (callback . ProfileCreationEncryptingMaster) (fromIntegral time) idKeyLogN idKeySalt pass
+          putStrLn "TRACE: Scrypt iterations has completed."
           let idKey = PrivateMasterKey $ enHash $ privateUnlockKey unlockKey
-              (block1enc, idKeyTag) = encryptGCM (initAES idKeyPass) idKeyIV (ssAAD block1) $ BS.concat [ privateMasterKey idKey, privateLockKey lockKey, empty256 ]
+              (block1enc, idKeyTag) = encryptGCM (initAES idKeyPass) idKeyIV ("ss1ssAAD" `pe` ssAAD block1) $ BS.concat [ privateMasterKey idKey, privateLockKey lockKey, empty256 ]
               (block2enc, unlockKeyTag) = encryptGCM (initAES unlockKeyPass) emptyIV (ssAAD block2) $ privateUnlockKey unlockKey
-              block1 = SecureStorageBlock1
-               { ss1CryptoIV     = idKeyIV
-               , ss1ScryptSalt   = idKeySalt
-               , ss1ScryptLogN   = idKeyLogN
-               , ss1ScryptIter   = idKeyIter
-               , ss1Flags        = flags
-               , ss1HintLen      = hintl
-               , ss1PwVerifySec  = time
-               , ss1HintIdle     = hintt
-               , ss1PlainExtra   = BS.empty
-               , ss1Encrypted    = block1enc
-               , ss1VerifyTag    = toBytes idKeyTag
-               }
-              block2 = SecureStorageBlock2
-               { ss2ScryptSalt   = unlockKeySalt
-               , ss2ScryptIter   = unlockKeyIter
-               , ss2ScryptLogN   = unlockKeyLogN
-               , ss2Encrypted    = block2enc
-               , ss2VerifyTag    = toBytes unlockKeyTag
-               }
+              block1 =
+                SecureStorageBlock1
+                { ss1CryptoIV     = "idKeyIV" `pe` idKeyIV
+                , ss1ScryptSalt   = "idKeySalt" `pe` idKeySalt
+                , ss1ScryptLogN   = "idKeyLogN" `pe` idKeyLogN
+                , ss1ScryptIter   = "idKeyIter" `pe` idKeyIter
+                , ss1Flags        = "flags" `pe` flags
+                , ss1HintLen      = "hintl" `pe` hintl
+                , ss1PwVerifySec  = "time" `pe` time
+                , ss1HintIdle     = "hintt" `pe` hintt
+                , ss1PlainExtra   = BS.empty
+                , ss1Encrypted    = bs96 -- waiting for encryption
+                , ss1VerifyTag    = bs16 -- waiting for encryption
+                }
+              block1' = 
+                "block1" `pe`
+                (block1 { ss1Encrypted = block1enc, ss1VerifyTag = "idKeyTag" `pe` toBytes idKeyTag })
+              block2 =
+                SecureStorageBlock2
+                { ss2ScryptSalt   = unlockKeySalt
+                , ss2ScryptIter   = unlockKeyIter
+                , ss2ScryptLogN   = unlockKeyLogN
+                , ss2Encrypted    = bs32
+                , ss2VerifyTag    = bs16
+                }
+              block2' =
+                block2 { ss2Encrypted = block2enc, ss2VerifyTag = toBytes unlockKeyTag }
               f' = f ++ ".ssss"
-              ss = SecureStorage True f' [Block00001 block1, Block00002 block2]
+              ss = SecureStorage True f' [Block00001 block1', Block00002 block2']
+          
+          putStrLn "TRACE: Saving secure storage..."
           saveSecureStorage ss
+          putStrLn "TRACE: Secure storage has been saved."
           return $ Right (SQRLProfile { profileName = name, profileUsed = Nothing, profileSecureStorage = openSecureStorage f' }, rcode)
-  where genKeys :: SystemRandom -> [ByteString] -> Either GenError (PrivateLockKey, PrivateUnlockKey, RescueCode)
-        genKeys g ntrpy = (genKeys' ntrpy . fst) <$> genBytes 128 g
-        genKeys' ntrpy genbytes =
-           let (shastate, chnks) = takeAtLeast10ButLeave10IfPossible (Crypto.Hash.SHA256.updates $ Crypto.Hash.SHA256.update Crypto.Hash.SHA256.init $ BS.take 96 genbytes) ntrpy
-               unlockKey = Crypto.Hash.SHA256.finalize shastate
-               lockKey = ED25519.exportPublic $ ED25519.generatePublic $ fromJust $ ED25519.importPrivate unlockKey
-               rcode = Crypto.Hash.SHA256.finalize $ Crypto.Hash.SHA256.updates shastate $ BS.drop 32 genbytes : chnks
-           in (PrivateLockKey lockKey, PrivateUnlockKey unlockKey, genRcode rcode)
-        takeAtLeast10ButLeave10IfPossible f x =
-          let (x0, x') = splitAt 10 x
-              (x1, x2) = splitAt 10 x'
-          in (f (x0 ++ x2), x1)
+  where genKeys :: SystemRandom -> IO SQRLEntropy -> Either GenError (IO (PrivateLockKey, PrivateUnlockKey, RescueCode))
+        genKeys g ntrpy = (genKeys' ntrpy . fst) <$> genBytes 768 g
+        genKeys' ntrpy genbytes = do
+          let cryptoinit = Crypto.Hash.SHA256.update Crypto.Hash.SHA256.init $ BS.take 512 genbytes
+          ntrpy0 <- ntrpy
+          (shastate, rest) <- case ntrpy0 of
+            NoEntropy -> return (cryptoinit, [])
+            SQRLEntropy ent0 ntrpy' -> ntrpy' >>= \ntrpy1 -> case ntrpy1 of
+              NoEntropy -> return (Crypto.Hash.SHA256.updates cryptoinit ent0, [])
+              SQRLEntropy ent1 ntrpy'' -> (\x -> (x, ent0)) <$> updateEntropy Crypto.Hash.SHA256.updates (Crypto.Hash.SHA256.updates cryptoinit ent1) ntrpy''
+          let unlockKey = Crypto.Hash.SHA256.finalize shastate
+              lockKey = ED25519.exportPublic $ ED25519.generatePublic $ fromJust $ ED25519.importPrivate unlockKey
+              rcode = Crypto.Hash.SHA256.finalize $ Crypto.Hash.SHA256.updates (Crypto.Hash.SHA256.update shastate $ BS.drop 512 genbytes) rest
+           in return (PrivateLockKey lockKey, PrivateUnlockKey unlockKey, genRcode rcode)
+        updateEntropy f a ntrpy = ntrpy >>= \r -> case r of
+          NoEntropy -> return a
+          SQRLEntropy bs ntrpy' -> let a' = f a bs in a' `seq` updateEntropy f a' ntrpy'
         genEncParams :: SystemRandom -> Either GenError (ByteString, LogN, Int, ByteString, ByteString, LogN)
         genEncParams g = (genEncParams' . fst) <$> genBytes (16 + 1 + 1 + 12 + 16 + 1) g
         genEncParams' :: ByteString -> (ByteString, LogN, Int, ByteString, ByteString, LogN)
         genEncParams' bs =
           let unlockKeySalt = BS.take 16 bs
-              unlockKeyLogN = (BS.index bs 16 .&. 0x7F) + 0x23
-              unlockKeyTime = fromIntegral (complement (BS.index bs 17 .&. 0x7F)) `shiftL` 2
+              unlockKeyLogN = (BS.index bs 16 .&. 0x03) + 0x9
+              unlockKeyTime = 60 --fromIntegral (complement (BS.index bs 17 .&. 0x7F)) `shiftR` 4
               idKeyIV = BS.take 12 $ BS.drop 18 bs
               idKeySalt = BS.take 16 $ BS.drop 30 bs
-              idKeyLogN = (BS.index bs 46 .&. 63) + 0x23
+              idKeyLogN = (BS.index bs 46 .&. 0x03) + 0x9
           in (unlockKeySalt, unlockKeyLogN, unlockKeyTime, idKeyIV, idKeySalt, idKeyLogN)
         bsToNatural :: ByteString -> Integer
         bsToNatural = BS.foldl (\i w -> (i `shiftL` 8) + fromIntegral w) 0
         genRcode :: ByteString -> RescueCode
-        genRcode = RescueCode . T.pack . take 24 . genRcode' . bsToNatural
+        genRcode rcodeb = RescueCode $ T.pack $ take 24 (genRcode' $ bsToNatural rcodeb)
         genRcode' i = let (i', r) = i `quotRem` 10 in head (show r) : genRcode' i'
+        bs32 = BS.replicate 32 0
+        bs96 = BS.replicate 96 0
+        bs16 = BS.replicate 16 0
 
 xorBS :: ByteString -> ByteString -> ByteString
 xorBS a = BS.pack . BS.zipWith xor a
@@ -587,7 +717,7 @@ chain i f h a b = let { i' = i - 1 ; a' = h a ; b' = f a' b} in i' `seq` (b' `se
 -- The resulting profile is returned if no error occured during the creation.
 createProfile :: (MonadIO io)
               => (ProfileCreationState -> IO ()) -- ^ a callback which gets notified when the state changes
-              -> IO [ByteString]                 -- ^ an external source of entropy (recommended minimum list length of 20 and bytestring length of 32), if none is available @return []@ should still generate an acceptable result.
+              -> IO SQRLEntropy                  -- ^ an external source of entropy (recommended minimum list length of 20 and bytestring length of 32), if none is available @return NoEntropy@ should still generate a working result.
               -> Text                            -- ^ name of this profile (may not collide with another)
               -> Text                            -- ^ password for this profile
               -> HintLength                      -- ^ the length the password hint should be (see 'HintLength')
