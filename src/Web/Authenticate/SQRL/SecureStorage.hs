@@ -130,6 +130,7 @@ data SecureStorageBlock1
     , ss1Encrypted    :: ByteString        -- ^ encrypted master key, lock key, unlock key etc (see 'SecureStorageBlock1Decrypted')
     , ss1VerifyTag    :: ByteString        -- ^ signature to validate no external changes has been made
     }
+  deriving (Show)
 
 -- | This is the decrypted data of 'SecureStorageBlock1' and contains decrypted keys and aditional decrypted data.
 data SecureStorageBlock1Decrypted
@@ -189,6 +190,7 @@ data SecureStorageBlock2
     , ss2Encrypted    :: ByteString        -- ^ encrypted emergency rescue code and any extended encrypted data not in spec as of yet (see 'SecureStorageBlock2Decrypted')
     , ss2VerifyTag    :: ByteString        -- ^ signature to validate no external changes has been made
     }
+  deriving (Show)
 
 -- | This is the decrypted data of 'SecureStorageBlock2' and contains an emergency rescue code to transfer an identity.
 data SecureStorageBlock2Decrypted
@@ -340,9 +342,11 @@ data SecureStorageBlock
   = Block00001 SecureStorageBlock1     -- ^ The most basic of storage blocks. Contains information about master key and encryption settings.
   | Block00002 SecureStorageBlock2     -- ^ Encrypted rescue code.
   | BlockOther Int LBS.ByteString      -- ^ Any other block not supported by the specification at the time of writing, or chosen not to implement. Pull requests are welcome.
+  deriving (Show)
 
 -- | A secure storage for a SQRL profile. Contains encrypted keys and SQRL settings.
 data SecureStorage = SecureStorage Bool String [SecureStorageBlock]
+                   deriving (Show)
 
 -- | Get the whole block as a lazy 'LBS.ByteString'.
 secureStorageData :: SecureStorageBlock -> LBS.ByteString
