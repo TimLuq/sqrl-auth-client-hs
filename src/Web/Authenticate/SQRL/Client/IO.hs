@@ -6,8 +6,10 @@ import Web.Authenticate.SQRL.Types
 import Web.Authenticate.SQRL.Client as C
 import Web.Authenticate.SQRL.Client.Types
 
+import Data.Word (Word8)
 import Network.HTTP.Types.Header
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Control.Monad.IO.Class (MonadIO, liftIO)
 --import qualified Data.Conduit as C
 --import Network.HTTP.Conduit
@@ -38,7 +40,7 @@ modifySQRLRequest f s =
       s0 = (sqrlRequest s) { requestBody = RequestBodyLBS bs }
   in s { sqrlRequest = s0, sqrlRequestPost = p }
 
-modifySQRLRequest' :: (Functor m, Monad m) => (SQRLClientPost ByteString -> m (SQRLClientPost ByteString)) -> SQRLRequest -> m (SQRLRequest)
+modifySQRLRequest' :: (Functor m, Monad m) => (SQRLClientPost ByteString -> m (SQRLClientPost ByteString)) -> SQRLRequest -> m SQRLRequest
 modifySQRLRequest' f s = do
   (p, bs) <- sqrlClientPostBytes <$> f (sqrlRequestPost s)
   let s0 = (sqrlRequest s) { requestBody = RequestBodyLBS bs }
@@ -72,20 +74,28 @@ sqrlExecuteCommand :: (MonadCatch m, MonadIO m, SQRLClientM clnt m) => SQRLComma
 sqrlExecuteCommand action manager req = handle (\e -> throwM (e :: IOException)) $ do
   liftIO $ putStrLn $ "TRACE: sqrlExecuteCommand: executing " ++ show action ++ "..."
   req' <- updateClientData action req
-  resp <- liftIO $ communicate req'
-  liftIO $ putStrLn "TRACE: sqrlExecuteCommand: response gathered..."
-  let bodys = LBS.toStrict $ responseBody resp
-  liftIO $ IO.withBinaryFile "/tmp/sqrl-last-server-response.dat" IO.WriteMode $ \h -> BS.hPut h bodys
-  let sdata = (readSQRLServerData BS.empty BS.empty bodys :: Either String (SQRLServerData ByteString))
-      pall  = ("server", enc64unpad bodys) : sqrlPostAll (sqrlRequestPost req)
-    in case sdata of
-        Left err -> fail err
-        Right sdata' -> do
-          liftIO $ putStrLn $ "TRACE: sqrlExecuteCommand: done executing " ++ show action ++ "."
-          return (req' { sqrlRequestPost = (sqrlRequestPost req) { sqrlServerData = Right sdata', sqrlPostAll = pall } }, sdata')
+  sdata0 <- doExecute req'
+  if (serverTransFlags (snd sdata0) .&. tifTransientError) == tifTransientError
+    then return sdata0
+    else doExecute (fst sdata0)
   where communicate req' = do
           IO.withBinaryFile "/tmp/sqrl-last-server-request.dat" IO.WriteMode $ \h -> LBS.hPut h (let RequestBodyLBS rb = requestBody (sqrlRequest req') in rb)
           httpLbs (sqrlRequest req') manager
+        qmrk = fromIntegral (fromEnum '?') :: Word8
+        doExecute req' = do
+          resp <- liftIO $ communicate req'
+          liftIO $ putStrLn "TRACE: sqrlExecuteCommand: response gathered..."
+          let bodys = LBS.toStrict $ responseBody resp
+          liftIO $ IO.withBinaryFile "/tmp/sqrl-last-server-response.dat" IO.WriteMode $ \h -> BS.hPut h bodys
+          let sdata = (readSQRLServerData BS.empty BS.empty bodys :: Either String (SQRLServerData ByteString))
+              pall  = ("server", enc64unpad bodys) : sqrlPostAll (sqrlRequestPost req)
+            in case sdata of
+                Left err -> fail err
+                Right sdata' -> do
+                  liftIO $ putStrLn $ "TRACE: sqrlExecuteCommand: done executing " ++ show action ++ "."
+                  return (req' { sqrlRequestPost = (sqrlRequestPost req') { sqrlServerData = Right sdata', sqrlPostAll = pall }
+                               , sqrlRequest = let (path', query') = BS.breakByte qmrk (TE.encodeUtf8 $ serverQueryPath sdata') in (sqrlRequest req') { path = path', queryString = query' }
+                               }, sdata')
 
 
 -- | A temporary 'SQRLClientPost'. 'sqrlClientData' and 'sqrlSignatures' MUST be overwritten ASAP.
@@ -141,7 +151,7 @@ sqrlConnectionFlow real_callback url = callback <<|| do
   liftIO $ putStrLn $ "TRACE: sqrlConnectionFlow: starting connection flow to: " ++ show url
   request <- parseUrl http
   clientdef <- sqrlClientDataDefault
-  wManager >>= \manager -> sqrlConnectFlow_0 callback manager (req_ (request { requestHeaders = [(hUserAgent, "SQRL/1"),(hContentType, "application/x-www-urlencoded")] }) clientdef) <||> callback
+  wManager >>= \manager -> sqrlConnectFlow_0 callback manager (req_ (request { requestHeaders = [(hUserAgent, "SQRL/1"),(hContentType, "application/x-www-urlencoded")], method = "POST" }) clientdef) <||> callback
   where callback x =
           liftIO (putStrLn ("TRACE: ClientErr = " ++ show x)) >>
           real_callback x <|> setClientError ClientErrNone -- allow for non-forked user interactions to error handle correctly
