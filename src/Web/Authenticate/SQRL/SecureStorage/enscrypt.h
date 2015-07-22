@@ -1,3 +1,9 @@
+/**
+ * EnScrypt - iterative calls to Scrypt for either a length of actual time or for a number of iterations.
+ * Each iteration produce a result by taking result_(i) = result_(i-1) XOR scrypt_i .
+ *
+ * Author: Tim Lundqvist
+**/
 #ifndef SQRL_ENSCRYPT_H
 #define SQRL_ENSCRYPT_H
 
