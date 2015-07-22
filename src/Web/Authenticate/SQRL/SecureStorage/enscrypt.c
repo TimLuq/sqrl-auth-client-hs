@@ -1,3 +1,9 @@
+/**
+ * EnScrypt - iterative calls to Scrypt for either a length of actual time or for a number of iterations.
+ * Each iteration produce a result by taking result_(i) = result_(i-1) XOR scrypt_i .
+ *
+ * Author: Tim Lundqvist
+**/
 #include "enscrypt.h"
 #include "crypto_scrypt.h"
 #include <time.h>
@@ -32,10 +38,8 @@ uint32_t sqrl_enscrypt_time(enscrypt_notify notify, int32_t dtime, uint8_t logn,
   time_t goal_time = current_time + dtime;
   uint8_t buff0[SQRL_ENSCRYPT_OUTPUT_SIZE];
   uint8_t buff1[SQRL_ENSCRYPT_OUTPUT_SIZE];
-  if (saltlen == SQRL_ENSCRYPT_OUTPUT_SIZE) {
-    memcpy(buff0, salt, SQRL_ENSCRYPT_OUTPUT_SIZE);
-  } else {
-    memcpy(buff0, salt, saltlen);
+  memcpy(buff0, salt, saltlen);
+  if (saltlen != SQRL_ENSCRYPT_OUTPUT_SIZE) {
     memset(buff0+saltlen, 0, SQRL_ENSCRYPT_OUTPUT_SIZE - saltlen);
   }
   memset(buff1, 0, SQRL_ENSCRYPT_OUTPUT_SIZE);
@@ -49,7 +53,7 @@ uint32_t sqrl_enscrypt_time(enscrypt_notify notify, int32_t dtime, uint8_t logn,
       if ((current_time = time(NULL)) >= goal_time) break;
       if (current_time != notify_time) notify((int32_t) ((((int32_t) (current_time - start_time)) * 100) / dtime), (int32_t) (goal_time - current_time), i);
     }
-    // generate scrypt result from salt and pass -> xor result with output and result is next salt
+    // generate scrypt result from salt and pass -> result_n XOR output_n = salt_(n+1)
     errcode = crypto_scrypt(pass, passlen, salt, saltlen, n, 256, 1, buff1, SQRL_ENSCRYPT_OUTPUT_SIZE);
     if (errcode != 0) {
       (void) fprintf(stderr, "ffi:sqrl_enscrypt_time: scrypt error occured (%d).\n", errno);
@@ -94,10 +98,8 @@ uint32_t sqrl_enscrypt_iter(uint32_t iterations, uint8_t logn,
   memset(output, 0, SQRL_ENSCRYPT_OUTPUT_SIZE);
   uint8_t buff0[SQRL_ENSCRYPT_OUTPUT_SIZE];
   uint8_t buff1[SQRL_ENSCRYPT_OUTPUT_SIZE];
-  if (saltlen == SQRL_ENSCRYPT_OUTPUT_SIZE) {
-    memcpy(buff0, salt, SQRL_ENSCRYPT_OUTPUT_SIZE);
-  } else {
-    memcpy(buff0, salt, saltlen);
+  memcpy(buff0, salt, saltlen);
+  if (saltlen != SQRL_ENSCRYPT_OUTPUT_SIZE) {
     memset(buff0+saltlen, 0, SQRL_ENSCRYPT_OUTPUT_SIZE - saltlen);
   }
   memset(buff1, 0, SQRL_ENSCRYPT_OUTPUT_SIZE);
@@ -107,7 +109,7 @@ uint32_t sqrl_enscrypt_iter(uint32_t iterations, uint8_t logn,
   int errcode;
 
   for (i = 0; i < iterations; i++) {
-    // generate scrypt result from salt and pass -> xor result with output and result is next salt
+    // generate scrypt result from salt and pass -> result_n XOR output_n = salt_(n+1)
     errcode = crypto_scrypt(pass, passlen, buff0, saltlen, n, 256, 1, buff1, SQRL_ENSCRYPT_OUTPUT_SIZE);
     if (errcode != 0) {
       (void) fprintf(stderr, "ffi:sqrl_enscrypt_iter: scrypt error occured (%d).\n", errno);
