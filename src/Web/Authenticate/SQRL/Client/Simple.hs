@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, CPP #-}
 module Web.Authenticate.SQRL.Client.Simple where
 
 import Web.Authenticate.SQRL.Types
@@ -26,7 +26,7 @@ import qualified Data.ByteString.Lazy as LBS
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Control.Concurrent.STM
---import Control.Concurrent
+import Control.Concurrent (forkIO)
 import Control.Applicative
 import Control.Monad (unless, foldM, foldM_, when, replicateM_)
 import Control.Monad.IO.Class (liftIO)
@@ -37,6 +37,16 @@ import System.Environment (getArgs)
 import System.Directory (doesFileExist, doesDirectoryExist, getDirectoryContents, getTemporaryDirectory)
 
 import Control.Exception (asyncExceptionFromException, bracket, catch, throwIO, SomeAsyncException, IOException)
+
+import Crypto.Random
+import Crypto.Cipher.AES
+import qualified Data.Binary as Binary
+import Data.Byteable
+
+
+#if MIN_VERSION_base(4,7,0)
+import System.Mem (performGC)
+#endif
 
 flush :: IO ()
 flush = IO.hFlush IO.stdout
@@ -49,8 +59,10 @@ simpleClientVersion = "0.0.0.0"
 simpleClientName :: Text
 simpleClientName = "Hasqrell Simple"
 
+type Hint = (Text, SecureStorageBlock1)
+
 -- | A 'TVar' containing the currently active user with a simplified encryption if the user has hinting allowed.
-hinted :: TVar (Maybe (Text, SecureStorageBlock1))
+hinted :: TVar (Maybe Hint)
 {-# NOINLINE hinted #-}
 hinted = unsafePerformIO $ newTVarIO Nothing
 
@@ -63,7 +75,7 @@ data SimpleClient
     , masterIdentity    :: Maybe PrivateMasterKey
     , masterLock        :: Maybe PrivateLockKey
     , previousUnlock    :: Maybe PrivateUnlockKey
-    , clientKeys        :: HashMap Text (DomainIdentityKey, DomainLockKey, Maybe DomainIdentityKey)
+    , clientKeys        :: HashMap Text (DomainIdentityKey, Maybe DomainIdentityKey)
     , clientError       :: ClientErr
     }
 
@@ -102,23 +114,30 @@ instance SQRLClientM SimpleClient IO where
   sqrlLoginAccount = loginAccountSimple
 
   sqrlIdentityKey url = sqrlClient $ \s -> case HashMap.lookup dom $ clientKeys s of
-    Just (k, _, _) -> return (s, k)
+    Just (k, _) -> return (s, k)
     Nothing -> s `runClient'` (loadKeys url >> sqrlIdentityKey url)
     where dom = sqrlUrlOrigin url
   sqrlIdentityKeyPrevious url = sqrlClient $ \s -> case HashMap.lookup dom $ clientKeys s of
-    Just (_, _, k) -> return (s, k)
+    Just (_, k) -> return (s, k)
     Nothing -> s `runClient'` (loadKeys url >> sqrlIdentityKeyPrevious url)
-    where dom = sqrlUrlOrigin url
-  sqrlLockKey url = sqrlClient $ \s -> case HashMap.lookup dom $ clientKeys s of
-    Just (_, k, _) -> return (s, k)
-    Nothing -> s `runClient'` (loadKeys url >> sqrlLockKey url)
     where dom = sqrlUrlOrigin url
 
   readClientError SimpleClient { clientError = e } = return e
   setClientError e = sqrlClient $ \s -> return (s { clientError = e }, ())
 
   sqrlClearHint  = sqrlClient' $ const clearHint
-  sqrlClearSensitive = sqrlClient $ \s -> return (s { masterIdentity = Nothing, masterLock = Nothing, previousUnlock = Nothing, clientKeys = HashMap.empty }, ())
+  sqrlClearSensitive = sqrlClient $ \s -> returnClear s { masterIdentity = Nothing, masterLock = Nothing, previousUnlock = Nothing, clientKeys = HashMap.empty }
+    where
+#if MIN_VERSION_base(4,7,0)
+      returnClear s' = seq s' (performGC >> return (s', ()))
+#else
+      returnClear = return . flip (,) ()
+#endif
+
+  generateUnlockKeys = generateUnlockKeys_ $ sqrlClient $ \s -> case masterLock s of
+    Nothing -> return (s { clientError = ClientErrNoProfile }, error "generateUnlockKeys: No keys could be generated due to no profile being active.")
+    Just ml -> return (s, ml)
+    
 
 errorMessage :: SimpleClient -> Maybe String
 errorMessage (SimpleClient { clientError = err }) = case err of
@@ -140,25 +159,25 @@ loadKeys url = sqrlClient_ $ \s -> flip (,) () <$> case selectedProfile s of
   Nothing -> return s { clientError = ClientErrNoProfile }
   Just pr -> do
     let name = profileName pr
-    (s', imk, lmk, pmk) <- case masterIdentity s of
-      Just imk' -> return (s, imk', fromJust (masterLock s), previousUnlock s)
+    (s', imk, pmk) <- case masterIdentity s of
+      Just imk' -> return (s, imk', previousUnlock s)
       Nothing   -> do
         mh <- atomically $ readTVar hinted
         if isNothing mh || fst (fromJust mh) /= name
          then profileSecureStorage pr >>= \x -> case x of
-           Left er -> return (s { clientError = ClientErrSecureStorage er }, mkPrivateKey empty256, mkPrivateKey empty256, Nothing)
+           Left er -> return (s { clientError = ClientErrSecureStorage er }, mkPrivateKey empty256, Nothing)
            Right r -> decryptWith (password name) (fromJust $ secureStorageData1 r) >>= decrResult s
          else decryptWith (passwordHint name) (snd $ fromJust mh) >>= decrResult s
     return $ case clientError s' of
-              ClientErrNone -> s' { clientKeys = HashMap.insert (sqrlUrlOrigin url) (deriveDomainKey url (imk :: PrivateMasterKey), deriveDomainKey url (lmk :: PrivateLockKey), deriveDomainKey url <$> (pmk :: Maybe PrivateUnlockKey)) (clientKeys s') }
+              ClientErrNone -> s' { clientKeys = HashMap.insert (sqrlUrlOrigin url) (deriveDomainKey url (imk :: PrivateMasterKey), deriveDomainKey url <$> (pmk :: Maybe PrivateUnlockKey)) (clientKeys s') }
               _ -> s'
-  where decrResult :: SimpleClient -> Either String SecureStorageBlock1Decrypted -> IO (SimpleClient, PrivateMasterKey, PrivateLockKey, Maybe PrivateUnlockKey)
+  where decrResult :: SimpleClient -> Either String SecureStorageBlock1Decrypted -> IO (SimpleClient, PrivateMasterKey, Maybe PrivateUnlockKey)
         decrResult s x1 = case x1 of
-          Left er -> return (s { clientError = ClientErrDecryptionFailed er }, mkPrivateKey empty256, mkPrivateKey empty256, Nothing)
+          Left er -> return (s { clientError = ClientErrDecryptionFailed er }, mkPrivateKey empty256, Nothing)
           Right d -> let imk' = identityMasterKey d
                          lmk' = identityLockKey d
                          pmk' = previousUnlockKey d
-                     in return (s { masterIdentity = Just imk', masterLock = Just lmk', previousUnlock = pmk' }, imk', lmk', pmk')
+                     in return (s { masterIdentity = Just imk', masterLock = Just lmk', previousUnlock = pmk' }, imk', pmk')
         password :: Text -> SecureStorageBlock1 -> IO Text
         password name _ = passinfo name >> T.pack <$> readPassword "Password"
         passwordHint :: Text -> SecureStorageBlock1 -> IO Text
@@ -280,7 +299,9 @@ clearHint =
   putStrLn "TRACE: clearing hint..." >>
   atomically (writeTVar hinted Nothing)
   <* putStrLn "TRACE: hint cleared."
-
+#if MIN_VERSION_base(4,7,0)
+  <* performGC
+#endif
 
 -- | This client uses 'SecureStorage' for it's profile management.
 instance SecureStorageProfile SimpleClient IO where
@@ -296,7 +317,7 @@ showProfilesSimple actiondesc mf ps = let ps_ = sortBy (compare `on` profileUsed
     putStrLn "" >> putStr "------- " >> T.putStr (if T.null actiondesc then "Profiles" else actiondesc) >> putStrLn " -------"
     let (ps', andAlso) = case hntd of
           Nothing -> (take 8 ps_, return ())
-          Just (nm, _) -> (take 8 $ filter ((/=) nm . profileName) ps_, putStr " 9 " >> T.putStrLn nm >> putStrLn "")
+          Just (nm, _) -> (take 8 $ filter ((/=) nm . profileName) ps_, putStr " 9. " >> T.putStrLn nm >> putStrLn "")
     foldM_ displayUser 1 ps'
     andAlso
     putStrLn ""
@@ -310,19 +331,19 @@ showProfilesSimple actiondesc mf ps = let ps_ = sortBy (compare `on` profileUsed
     case r of
      "0" -> createProfileSimple createProfile mf "" ""
      [x] -> if x > '0' && x <= head (show $ length ps')
-               then chooseProfileSimple actiondesc mf $ ps' !! (fromEnum x - fromEnum '1')
-               else sspShowProfiles actiondesc mf $ filter (T.isInfixOf (T.singleton x) . profileName) ps_
+               then chooseProfileSimple Nothing actiondesc mf $ ps' !! (fromEnum x - fromEnum '1')
+               else case (x, hntd) of
+                     ('9', Just _) -> chooseProfileSimple hntd actiondesc mf $ ps' !! (fromEnum x - fromEnum '1')
+                     _ -> sspShowProfiles actiondesc mf $ filter (T.isInfixOf (T.singleton x) . profileName) ps_
      _   -> sspShowProfiles actiondesc mf $ filter (T.isInfixOf (T.pack r) . profileName) ps_
   where displayUser :: Int -> SQRLProfile -> IO Int
         displayUser n p =  putStr (" " ++ show n ++ ". ") >> T.putStrLn (profileName p) >> putStr "    last used: " >> print (profileUsed p) >> return (n + 1)
 
-chooseProfileSimple :: Text -> (SimpleClient -> IO ()) -> SQRLProfile -> IO ()
-chooseProfileSimple actiondesc mf prof = do
-  hint <- atomically $ readTVar hinted
+chooseProfileSimple :: Maybe Hint -> Text -> (SimpleClient -> IO ()) -> SQRLProfile -> IO ()
+chooseProfileSimple hint _{-actiondesc-} mf prof =
   case hint of
    Nothing -> fromScratch 2
-   Just (hu, hw) -> if hu == profileName prof
-                    then askHint hw else fromScratch 2
+   Just (_, hw) -> askHint hw
   where fromScratch :: Int -> IO ()
         fromScratch 0 = do
           clearHint
@@ -337,13 +358,23 @@ chooseProfileSimple actiondesc mf prof = do
              case ssDecrypt pass ss1 of
               Nothing -> fromScratch (n-1)
               Just de -> do
-                -- TODO: Write to 'hinted'
+                _ <- forkIO $ storeHint ss1 de (profileName prof) pass
                 mf emptyClient { selectedProfile = Just prof, masterIdentity = Just $ identityMasterKey de, masterLock = Just $ identityLockKey de, previousUnlock = previousUnlockKey de }
         askHint ss1 = do
           mdec <- flip ssDecrypt ss1 . T.pack . take (fromIntegral $ ss1HintLen ss1) <$> readPassword "Password hint"
           case mdec of
            Nothing -> clearHint >> fromScratch 1
            Just de -> mf emptyClient { selectedProfile = Just prof, masterIdentity = Just $ identityMasterKey de, masterLock = Just $ identityLockKey de, previousUnlock = previousUnlockKey de }
+        storeHint :: SecureStorageBlock1 -> SecureStorageBlock1Decrypted -> Text -> Text -> IO ()
+        storeHint ss1 de user pass = do
+          g <- newGenIO :: IO SystemRandom
+          let (salt0, g') = throwLeft $ genBytes 32 g
+              (salt1, _ ) = throwLeft $ genBytes 32 g'
+              ss1' = ss1 { ss1CryptoIV = salt0, ss1ScryptSalt = salt1, ss1ScryptLogN = 9, ss1ScryptIter = 10 }
+              pass' = enScrypt 10 9 salt1 $ T.take (fromIntegral $ ss1HintLen ss1) pass
+              (block1enc, idKeyTag) = encryptGCM (initAES pass') salt0 (ssAAD ss1') $ LBS.toStrict $ Binary.encode de
+              ss1'' = block1enc `seq` ss1' { ss1Encrypted = block1enc, ss1VerifyTag = toBytes idKeyTag }
+          seq ss1'' $ atomically $ writeTVar hinted $ Just (user, ss1'')
         errorClient x = putStrLn (" User interaction caused " ++ show x)>> mf emptyClient { clientError = x }
 
 createProfileSimple :: ((ProfileCreationState -> IO ())    -- ^ a callback which gets notified when the state changes
