@@ -24,6 +24,7 @@ import Control.Applicative
 --import Data.Binary
 import Data.Bits
 import System.IO as IO
+import qualified System.Info
 
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -31,7 +32,7 @@ import Control.Exception (IOException)
 import Control.Monad.Catch (MonadCatch, throwM, handle)
 import Control.Concurrent.MVar
 
-data SQRLRequest = SQRLRequest { sqrlRequest :: Request, sqrlRequestPost :: SQRLClientPost ByteString, sqrlRequestURL :: SQRLUrl }
+data SQRLRequest = SQRLRequest { sqrlRequest :: Request, sqrlRequestPost :: SQRLClientPost ByteString, sqrlRequestURL :: SQRLUrl } deriving (Show)
 type SQRLClientRequest clnt m t = SQRLRequest -> SQRLClient clnt m (SQRLRequest, t)
 
 modifySQRLRequest :: (SQRLClientPost ByteString -> SQRLClientPost ByteString) -> SQRLRequest -> SQRLRequest
@@ -65,7 +66,15 @@ updateClientData :: (MonadIO m, SQRLClientM clnt m) => SQRLCommandAction -> SQRL
 updateClientData action req@SQRLRequest { sqrlRequestURL = url } = do
   liftIO $ putStrLn $ "TRACE: updateClientData: updating " ++ show url ++ "..."
   s <- getClientState
-  req' <- flip modifySQRLRequest' req $ \post -> sqrlSignPost url $ modifySQRLClientData (\cdata -> cdata { clientVersion = C.sqrlVersion s, clientCommand = action }) post
+  (serverunlockkey, verifyunlockkey) <- case action of
+    IDENT -> case sqrlServerData $ sqrlRequestPost req of
+      Left  _ -> return (Nothing, Nothing)
+      Right r -> if (serverTransFlags r .&. tifCurrentIDMatch) == tifCurrentIDMatch
+                 then return (Nothing, Nothing)
+                 else (\(a, b) -> (Just a, Just b)) <$> generateUnlockKeys
+    _ -> return (Nothing, Nothing)
+  req' <- flip modifySQRLRequest' req $ \post -> sqrlSignPost url $
+          modifySQRLClientData (\cdata -> cdata { clientVersion = C.sqrlVersion s, clientCommand = action, clientServerUnlock = serverunlockkey, clientVerifyUnlock = verifyunlockkey }) post
   liftIO $ putStrLn "TRACE: updateClientData: signed."
   return req'
 
@@ -75,11 +84,11 @@ sqrlExecuteCommand action manager req = handle (\e -> throwM (e :: IOException))
   liftIO $ putStrLn $ "TRACE: sqrlExecuteCommand: executing " ++ show action ++ "..."
   req' <- updateClientData action req
   sdata0 <- doExecute req'
-  if (serverTransFlags (snd sdata0) .&. tifTransientError) == tifTransientError
+  if (serverTransFlags (snd sdata0) .&. tifTransientError) /= tifTransientError
     then return sdata0
     else doExecute (fst sdata0)
   where communicate req' = do
-          IO.withBinaryFile "/tmp/sqrl-last-server-request.dat" IO.WriteMode $ \h -> LBS.hPut h (let RequestBodyLBS rb = requestBody (sqrlRequest req') in rb)
+          IO.withBinaryFile "/tmp/sqrl-last-server-request.dat" IO.WriteMode $ \h -> LBS.hPut h (let RequestBodyLBS rb = requestBody (sqrlRequest req') in rb) >> hPutStr h ("\n\n" ++ show req')
           httpLbs (sqrlRequest req') manager
         qmrk = fromIntegral (fromEnum '?') :: Word8
         doExecute req' = do
@@ -88,11 +97,12 @@ sqrlExecuteCommand action manager req = handle (\e -> throwM (e :: IOException))
           let bodys = LBS.toStrict $ responseBody resp
           liftIO $ IO.withBinaryFile "/tmp/sqrl-last-server-response.dat" IO.WriteMode $ \h -> BS.hPut h bodys
           let sdata = (readSQRLServerData BS.empty BS.empty bodys :: Either String (SQRLServerData ByteString))
-              pall  = ("server", enc64unpad bodys) : sqrlPostAll (sqrlRequestPost req)
+              pall  = ("server", bodys) : sqrlPostAll (sqrlRequestPost req)
             in case sdata of
                 Left err -> fail err
                 Right sdata' -> do
                   liftIO $ putStrLn $ "TRACE: sqrlExecuteCommand: done executing " ++ show action ++ "."
+                  liftIO $ IO.withBinaryFile "/tmp/sqrl-last-server-response.dat" IO.AppendMode $ \h -> hPutStr h ("\n\n" ++ show sdata')
                   return (req' { sqrlRequestPost = (sqrlRequestPost req') { sqrlServerData = Right sdata', sqrlPostAll = pall }
                                , sqrlRequest = let (path', query') = BS.breakByte qmrk (TE.encodeUtf8 $ serverQueryPath sdata') in (sqrlRequest req') { path = path', queryString = query' }
                                }, sdata')
@@ -127,15 +137,18 @@ managerVar = unsafePerformIO $ newMVar Nothing
 wManager :: (MonadIO m) => m Manager
 wManager = liftIO $ modifyMVar managerVar $ \mman -> case mman of
     Just man' -> return (mman, man')
-    Nothing   -> (\x -> (Just x, x)) <$> newManager tlsManagerSettings
+    Nothing   -> (\x -> (Just x, x)) <$> newManager (managerSetInsecureProxy (useProxy (Proxy "localhost" 23889)) tlsManagerSettings)
 
 -- | Connect the client to a host.
 sqrlConnect :: (MonadCatch m, MonadIO m, SQRLClientM clnt m) => SQRLUrl -> SQRLClient clnt m (SQRLRequest, SQRLServerData ByteString)
 sqrlConnect url = do
   request <- parseUrl http
-  wManager >>= \manager -> sqrlExecuteCommand QUERY manager (req request { requestHeaders = [(hUserAgent, "SQRL/1"),(hContentType, "application/x-www-urlencoded")] })
+  wManager >>= \manager -> sqrlExecuteCommand QUERY manager (req request { requestHeaders = hdrs })
   where req request = SQRLRequest { sqrlRequest = request, sqrlRequestPost = defpostdata url, sqrlRequestURL = url }
         http = sqrlUrlToHttp url
+        hdrs = [ (hUserAgent, "SQRL/1 (" ++ System.Info.os ++ "; " ++ System.Info.arch ++ ") hasqrell/" ++ thisVersion ++ " (cps; markdown)")
+               , (hContentType, "application/x-www-urlencoded")
+               ]
 
 -- | Connect to a SQRL server and do the most common communication flow. These include:
 -- # Query server for association.
