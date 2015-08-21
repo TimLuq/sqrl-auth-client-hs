@@ -23,6 +23,7 @@ import Control.Monad ((>=>))
 import Control.Exception (toException)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Catch (MonadThrow, throwM, MonadCatch, catch)
+import Crypto.Random
 
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -142,8 +143,6 @@ class (Monad m, Functor m) => SQRLClientM clnt m | clnt -> m where
   sqrlIdentityKey :: SQRLUrl -> SQRLClient clnt m DomainIdentityKey
   -- | The private key of the previous identity for a single domain.
   sqrlIdentityKeyPrevious :: SQRLUrl -> SQRLClient clnt m (Maybe DomainIdentityKey)
-  -- | The lock key of the current identity for a single domain.
-  sqrlLockKey :: SQRLUrl -> SQRLClient clnt m DomainLockKey
   -- | Lets the user choose the profile to use when executing a client session.
   sqrlChooseProfile :: Text                  -- ^ short description why a profile is to be selected
                     -> SQRLClient clnt m ()  -- ^ action for the selected profile
@@ -175,6 +174,14 @@ class (Monad m, Functor m) => SQRLClientM clnt m | clnt -> m where
   readClientError :: clnt -> m ClientErr
   -- | Sets the error associated to this state.
   setClientError :: ClientErr -> SQRLClient clnt m ()
+  -- | Dictates how keys should be generated.
+  randomKeyGenerator :: SQRLClient clnt m RandomLockKey
+  default randomKeyGenerator :: (MonadIO m, Functor m) => SQRLClient clnt m RandomLockKey
+  randomKeyGenerator = SQRLClient $ \x -> (,) x <$> liftIO randomKeyGenerator'
+  -- | Generate a 'ServerUnlockKey' and a 'VerifyUnlockKey'.
+  -- These should be generated using the @Identity Lock File@ and 'randomKeyGenerator'.
+  generateUnlockKeys :: SQRLClient clnt m (ServerUnlockKey, VerifyUnlockKey)
+  -- | 
   -- | Default 'SQRLClientData' to send to server.
   sqrlClientDataDefault :: SQRLClient clnt m SQRLClientData
   sqrlClientDataDefault = do
@@ -192,7 +199,19 @@ class (Monad m, Functor m) => SQRLClientM clnt m | clnt -> m where
       }
 
 
+-- | Genearates a 'RandomLockKey' from the 'SystemRandom' source.
+randomKeyGenerator' :: (MonadIO io, Functor io) => io RandomLockKey
+randomKeyGenerator' = (mkDomainKey . fst . throwLeft . genBytes 32) <$> liftIO (newGenIO :: IO SystemRandom)
 
+-- | 
+generateUnlockKeys_ :: SQRLClientM clnt m => SQRLClient clnt m PrivateLockKey -> SQRLClient clnt m (ServerUnlockKey, VerifyUnlockKey)
+generateUnlockKeys_ f = randomKeyGenerator >>= \x -> f >>= \y -> SQRLClient $ \s -> return (s, (generatePublic x, mkVerifyUnlockKey x y))
+{-
+generateUnlockKeys_ (SQRLClient f) = let SQRLClient g = randomKeyGenerator in SQRLClient $ \s -> do
+  (s', x ) <- g s
+  (s'', y) <- f s'
+  return (s'', (generatePublic x, mkVerifyUnlockKey x y))
+-}
 
 -- | The default implementation of signing a 'SQRLClientPost' using the loaded identities. (See 'sqrlSignPost'.)
 sqrlSignPost' :: (SQRLClientM clnt m) => SQRLUrl -> SQRLClientPost a -> SQRLClient clnt m (SQRLClientPost a)
@@ -202,8 +221,9 @@ sqrlSignPost' url post = do
   let post' = modifySQRLClientData (\cdata -> cdata { clientIdentity = cid, clientPreviousID = pid }) post
       post_ = sqrlPostAll post'
       signb :: ByteString
-      signb = (fromMaybe (error "sqrlSignPost': no server data") . lookup "server") post_ `BS.append` (fromMaybe (error "sqrlSignPost': no client data") . lookup "client") post_
-    in return $ modifySQRLSignatures (\sigs -> sigs { signIdentity = csig signb, signPreviousID = (\f -> f signb) <$> psig, signUnlock = Nothing }) post'
+      signb = (fromMaybe (error "sqrlSignPost': no server data") . lookup "client") post_ `BS.append` (fromMaybe (error "sqrlSignPost': no client data") . lookup "server") post_
+      wrtfl = unsafePerformIO $ BS.writeFile "/tmp/sqrl-last-sign.log" signb
+    in seq wrtfl $ return $ modifySQRLSignatures (\sigs -> sigs { signIdentity = csig signb, signPreviousID = (\f -> f signb) <$> psig, signUnlock = Nothing }) post'
 
 
 -- | The default implementation of signing a blob using the current identity. (See 'sqrlSign'.)
